@@ -8,7 +8,7 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 <!-- END:nextjs-agent-rules -->
 
-# Rules for every agent (Claude Code, Grok Build, Codex)
+# Rules for every agent (Claude Code, Grok Build, Codex, Jules)
 
 This repo is part of the **30 apps in 30 days** portfolio. The full playbook lives in
 [BreakthruDevelopment/ai-dev-os](https://github.com/BreakthruDevelopment/ai-dev-os); these are the rules
@@ -20,7 +20,8 @@ The BreakthruDevelopment org holds other, unrelated applications.
 
 - Touch only repos with the GitHub topic `30-apps-30-days`. Everything else is read-only.
 - Never force-push, delete, rename, transfer or archive any repo or branch you didn't create for the current task.
-- Never push to `main`. Open a PR from a branch named `<tool>/<short-task>` (e.g. `claude/items-api`, `grok/dashboard-ui`, `codex/fix-flaky-test`).
+- Never push to `main`. Open a PR from a branch named `<harness>/<short-task>` (e.g. `claude/items-api`, `grok/dashboard-ui`, `codex/fix-flaky-test`, `jules/gcp-terraform`).
+- Pick up only issues labeled for your harness, and follow the role file named in the issue title (`ai-dev-os/roles/`).
 - Never commit secrets. `.env.local` is ignored; real values live in each cloud's secret manager.
 
 ## Stack
