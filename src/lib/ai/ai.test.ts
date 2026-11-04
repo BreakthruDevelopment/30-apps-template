@@ -102,3 +102,15 @@ describe("generate", () => {
     ).rejects.toMatchObject({ kind: "invalid_output" });
   });
 });
+
+describe("missing provider key", () => {
+  it("answers from the demo fixture instead of failing", async () => {
+    setEnv({ AI_PROVIDER: "gemini" });
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    const result = await generate({ task: "summarize-items", system: "s", prompt: "p", schema });
+    expect(result.demo).toBe(true);
+    expect(result.provider).toBe("demo");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
