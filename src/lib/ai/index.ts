@@ -16,14 +16,25 @@ const DEFAULT_MODELS = {
   anthropic: "claude-haiku-5-5",
 } as const;
 
+let warnedMissingKey = false;
+
+/** A provider is configured but its key isn't: answer from the demo fixtures instead of failing. */
+function missingKey(provider: string, variable: string): null {
+  if (!warnedMissingKey) {
+    log.warn("ai.provider.missing_key", { provider, variable, fallback: "demo" });
+    warnedMissingKey = true;
+  }
+  return null;
+}
+
 function liveProvider(): AiProvider | null {
   const e = env();
   if (e.AI_PROVIDER === "gemini") {
-    if (!e.GEMINI_API_KEY) throw new Error("AI_PROVIDER=gemini needs GEMINI_API_KEY");
+    if (!e.GEMINI_API_KEY) return missingKey("gemini", "GEMINI_API_KEY");
     return geminiProvider(e.GEMINI_API_KEY, e.AI_MODEL ?? DEFAULT_MODELS.gemini);
   }
   if (e.AI_PROVIDER === "anthropic") {
-    if (!e.ANTHROPIC_API_KEY) throw new Error("AI_PROVIDER=anthropic needs ANTHROPIC_API_KEY");
+    if (!e.ANTHROPIC_API_KEY) return missingKey("anthropic", "ANTHROPIC_API_KEY");
     return anthropicProvider(e.ANTHROPIC_API_KEY, e.AI_MODEL ?? DEFAULT_MODELS.anthropic);
   }
   return null;
