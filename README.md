@@ -57,8 +57,12 @@ CI runs all of these plus both container builds on every pull request.
 
 ## Deploy
 
-One image, four clouds; see `infra/`. Migrations run as a separate one-off job (`docker build --target migrate`)
-before the new version goes live, never on web-server startup.
+Every push to `main` publishes a multi-arch image (x86 and ARM) to GitHub Container Registry as
+`ghcr.io/breakthrudevelopment/<repo>:sha-<commit>`. [30-apps-infra](https://github.com/BreakthruDevelopment/30-apps-infra)
+deploys those tags to AWS, Azure, Google Cloud and Oracle Cloud with Terraform; this repo holds no cloud credentials.
+
+With `MIGRATE_ON_START=true` the server applies pending migrations before taking traffic, holding a Postgres
+advisory lock so instances starting together can't race. `pnpm db:migrate` does the same by hand.
 
 ## Using the AI feature
 
