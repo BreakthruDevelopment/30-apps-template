@@ -22,6 +22,12 @@ for path in / /sign-in; do
 done
 pass "pages render inside the shared shell"
 
+for path in /dashboard /admin; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL$path")
+  [ "$code" = "307" ] || fail "signed-out $path should redirect (307), got $code"
+done
+pass "signed-out dashboard and admin redirect"
+
 signup() {
   local jar=$1 email=$2
   curl -fsS -c "$jar" -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \

@@ -48,7 +48,7 @@ export async function AppShell({ children, nav }: { children: ReactNode; nav?: R
                 width={115}
                 height={32}
                 unoptimized
-                priority
+                preload
                 className="h-8 w-auto"
               />
             </span>

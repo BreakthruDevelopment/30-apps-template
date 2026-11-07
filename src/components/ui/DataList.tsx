@@ -42,7 +42,7 @@ export function DataList<T>({
   return (
     <>
       {tableOnly && (
-        <div className="hidden sm:block">
+        <div className="hidden overflow-x-auto sm:block">
           <table className="w-full text-left text-sm">
             <caption className="sr-only">{caption}</caption>
             <thead className="bg-background text-muted">
@@ -57,11 +57,17 @@ export function DataList<T>({
             <tbody className="divide-y divide-border">
               {rows.map((row) => (
                 <tr key={rowKey(row)}>
-                  {columns.map((c) => (
-                    <td key={c.key} className={`px-3 py-3 align-middle ${c.className ?? ""}`}>
-                      {c.cell(row)}
-                    </td>
-                  ))}
+                  {columns.map((c) =>
+                    c === primary ? (
+                      <th key={c.key} scope="row" className={`px-3 py-3 text-left align-middle font-normal ${c.className ?? ""}`}>
+                        {c.cell(row)}
+                      </th>
+                    ) : (
+                      <td key={c.key} className={`px-3 py-3 align-middle ${c.className ?? ""}`}>
+                        {c.cell(row)}
+                      </td>
+                    ),
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -74,7 +80,7 @@ export function DataList<T>({
       >
         {rows.map((row) => (
           <li key={rowKey(row)} className="space-y-2 rounded-card border border-border bg-surface p-4">
-            <div className="font-semibold break-words">{primary.cell(row)}</div>
+            <h3 className="font-semibold break-words">{primary.cell(row)}</h3>
             <dl className="space-y-1 text-sm">
               {rest
                 .filter((c) => !c.hideLabel)

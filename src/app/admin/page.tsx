@@ -1,6 +1,6 @@
 import { desc } from "drizzle-orm";
 import type { Metadata } from "next";
-import { type Column, DataList, PageIntro, Panel, StatGrid, StatTile, StatusBadge } from "@/components/ui";
+import { type Column, DataList, PageIntro, Panel, StatGrid, StatTile } from "@/components/ui";
 import { requireRoleOrRedirect } from "@/lib/auth/session";
 import { db, schema } from "@/lib/db";
 
@@ -28,7 +28,7 @@ export default async function AdminPage() {
     {
       key: "role",
       header: "Role",
-      cell: (u) => (u.role === "admin" ? <StatusBadge status="live" label="Admin" /> : "User"),
+      cell: (u) => (u.role === "admin" ? <span className="inline-flex rounded-md bg-accent-soft px-2 py-0.5 text-sm font-medium text-accent">Admin</span> : "User"),
     },
     {
       key: "joined",

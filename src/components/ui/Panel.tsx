@@ -1,9 +1,10 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 import { CollapsiblePanel } from "./CollapsiblePanel";
-import { PanelHeader, slug } from "./PanelHeader";
+import { PanelHeader } from "./PanelHeader";
 
 /** A titled white panel. `collapsible` swaps in the small client component that adds the toggle. */
 export function Panel({
+  id,
   title,
   count,
   action,
@@ -13,6 +14,8 @@ export function Panel({
   closedLabel = "Show all",
   children,
 }: {
+  /** Heading id; generated when omitted. */
+  id?: string;
   title: string;
   count?: number;
   action?: ReactNode;
@@ -22,9 +25,13 @@ export function Panel({
   closedLabel?: string;
   children: ReactNode;
 }) {
+  const autoId = useId();
+  const headingId = id ?? `panel-${autoId}`;
   if (collapsible) {
     return (
       <CollapsiblePanel
+        headingId={headingId}
+        action={action}
         title={title}
         count={count}
         defaultOpen={defaultOpen}
@@ -36,8 +43,8 @@ export function Panel({
     );
   }
   return (
-    <section aria-labelledby={`panel-${slug(title)}`} className="mb-6 rounded-card border border-border bg-surface p-4 sm:p-5">
-      <PanelHeader id={`panel-${slug(title)}`} title={title} count={count} action={action} />
+    <section aria-labelledby={headingId} className="mb-6 rounded-card border border-border bg-surface p-4 sm:p-5">
+      <PanelHeader id={headingId} title={title} count={count} action={action} />
       {children}
     </section>
   );

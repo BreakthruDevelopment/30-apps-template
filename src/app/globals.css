@@ -11,15 +11,16 @@
   --foreground: #16202b;
   --muted: #566170;
   --border: #dde1e8;
+  --border-strong: #7d8796; /* 3:1 against surface, for field borders */
   --accent: #005fb1; /* Breakthru blue, sampled from the logo */
   --accent-foreground: #ffffff;
   --accent-soft: #e6f0fa;
   --logo-chip: #ffffff;
 
   --danger: #b42318;
-  --success: #1a7f37;
+  --success: #177533;
 
-  --live: #1a7f37;
+  --live: #177533;
   --live-soft: #e2f4e7;
   --building: #8a5300;
   --building-soft: #fcefd3;
@@ -38,6 +39,7 @@
     --foreground: #e8ecf2;
     --muted: #9ba5b3;
     --border: #2a323d;
+    --border-strong: #6b7686;
     --accent: #5aa9f0;
     --accent-foreground: #06121f;
     --accent-soft: #14283d;
@@ -63,6 +65,7 @@
   --color-foreground: var(--foreground);
   --color-muted: var(--muted);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent-soft: var(--accent-soft);

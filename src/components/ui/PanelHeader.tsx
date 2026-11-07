@@ -1,9 +1,5 @@
 import type { ReactNode } from "react";
 
-export function slug(s: string) {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-}
-
 export function PanelHeader({
   id,
   title,

@@ -1,10 +1,12 @@
 "use client";
 
 import { useId, useState, type ReactNode } from "react";
-import { PanelHeader, slug } from "./PanelHeader";
+import { PanelHeader } from "./PanelHeader";
 import { buttonSecondary } from "./styles";
 
 export function CollapsiblePanel({
+  headingId,
+  action,
   title,
   count,
   defaultOpen,
@@ -12,6 +14,8 @@ export function CollapsiblePanel({
   closedLabel,
   children,
 }: {
+  headingId: string;
+  action?: ReactNode;
   title: string;
   count?: number;
   defaultOpen: boolean;
@@ -22,12 +26,14 @@ export function CollapsiblePanel({
   const [open, setOpen] = useState(defaultOpen);
   const bodyId = useId();
   return (
-    <section aria-labelledby={`panel-${slug(title)}`} className="mb-6 rounded-card border border-border bg-surface p-4 sm:p-5">
+    <section aria-labelledby={headingId} className="mb-6 rounded-card border border-border bg-surface p-4 sm:p-5">
       <PanelHeader
-        id={`panel-${slug(title)}`}
+        id={headingId}
         title={title}
         count={count}
         action={
+          <div className="flex flex-wrap items-center gap-3">
+            {action}
           <button
             type="button"
             aria-expanded={open}
@@ -38,6 +44,7 @@ export function CollapsiblePanel({
             {open ? openLabel : closedLabel}
             <span aria-hidden>{open ? "⌃" : "⌄"}</span>
           </button>
+          </div>
         }
       />
       <div id={bodyId} hidden={!open}>

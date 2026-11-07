@@ -86,6 +86,7 @@ export default async function DashboardPage({ searchParams }: PageProps<"/dashbo
 
       <Panel title={user.role === "admin" ? "All items" : "Your items"} count={all.length}>
         <FilterBar
+          label="Filter items"
           search={{ value: q, placeholder: "Search items…" }}
           sort={{ name: "sort", label: "Sort", value: sort, options: sorts }}
           view={{ value: view }}

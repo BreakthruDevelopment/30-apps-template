@@ -63,6 +63,9 @@ IBM Plex Mono (`font-mono`). Set the app's name once in `src/lib/app-config.ts` 
 | `Panel` | `src/components/ui/` | Titled panel; `collapsible` adds a "Show all" toggle (small client component) |
 | `DemoBadge` | `src/components/ui/` | "Demo data" label for seeded or demo content |
 
+The header links come from `NAV_LINKS` in `src/lib/app-config.ts`; each app must edit that list (the template's
+`/dashboard` and `/admin` links break if the app deletes those pages).
+
 Shared button and field classes are in `src/components/ui/styles.ts` (44px minimum height). Don't add `loading.tsx` or
 `<Suspense>` above a page that calls `requireRoleOrRedirect()` or `notFound()`.
 

@@ -11,6 +11,6 @@ export const buttonOutlineAccent = `${buttonBase} border border-accent bg-surfac
 export const buttonDanger = `${buttonBase} border border-border bg-surface text-danger hover:bg-blocked-soft`;
 
 export const inputClass =
-  "min-h-11 w-full rounded-card border border-border bg-surface px-3 py-2 text-base text-foreground placeholder:text-muted focus:border-accent";
+  "min-h-11 w-full rounded-card border border-border-strong bg-surface px-3 py-2 text-base text-foreground placeholder:text-muted focus:border-accent";
 
 export const labelClass = "block space-y-1 text-sm font-medium";
