@@ -74,8 +74,8 @@ describe("embed (demo)", () => {
 });
 
 describe("embed (gemini)", () => {
-  it("sends batchEmbedContents with taskType and 768 dims, and normalizes", async () => {
-    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "test-key" });
+  it("sends batchEmbedContents with taskType and 768 dims for gemini-embedding-001, and normalizes", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "test-key", AI_EMBED_MODEL: "gemini-embedding-001" });
     const fetchMock = vi.fn().mockResolvedValue(ok([vec(768, 2), vec(768, 3)]));
     vi.stubGlobal("fetch", fetchMock);
     const r = await embed({ task: "t", texts: ["a", "b"], kind: "document" });
@@ -93,24 +93,35 @@ describe("embed (gemini)", () => {
     expect(norm(r.vectors[1])).toBeCloseTo(1, 6);
   });
 
-  it("uses RETRIEVAL_QUERY for queries", async () => {
-    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
+  it("uses RETRIEVAL_QUERY for queries on gemini-embedding-001", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k", AI_EMBED_MODEL: "gemini-embedding-001" });
     const fetchMock = vi.fn().mockResolvedValue(ok([vec(768)]));
     vi.stubGlobal("fetch", fetchMock);
     await embed({ task: "t", texts: ["q"], kind: "query" });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).requests[0].taskType).toBe("RETRIEVAL_QUERY");
   });
 
-  it("puts the task instruction in the text for gemini-embedding-2", async () => {
-    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k", AI_EMBED_MODEL: "gemini-embedding-2" });
+  it("defaults to gemini-embedding-2 with the documented text prefixes and no taskType", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
     const fetchMock = vi.fn().mockResolvedValue(ok([vec(768)]));
     vi.stubGlobal("fetch", fetchMock);
     const r = await embed({ task: "t", texts: ["hello"], kind: "query" });
-    const req = JSON.parse(fetchMock.mock.calls[0][1].body).requests[0];
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("gemini-embedding-2:batchEmbedContents");
+    const req = JSON.parse(init.body).requests[0];
     expect(req.taskType).toBeUndefined();
-    expect(req.content.parts[0].text).toContain("hello");
-    expect(req.content.parts[0].text).not.toBe("hello");
+    expect(req).toMatchObject({ model: "models/gemini-embedding-2", outputDimensionality: 768 });
+    expect(req.content.parts[0].text).toBe("task: search result | query: hello");
     expect(r.model).toBe("gemini-embedding-2");
+
+    fetchMock.mockResolvedValue(ok([vec(768)]));
+    await embed({ task: "t", texts: ["hello"], kind: "document" });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).requests[0].content.parts[0].text).toBe("title: none | text: hello");
+  });
+
+  it("rejects empty or whitespace-only texts", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
+    await expect(embed({ task: "t", texts: ["ok", "  "], kind: "document" })).rejects.toMatchObject({ kind: "input_rejected" });
   });
 
   it("on 429 falls back to demo vectors labelled as demo", async () => {

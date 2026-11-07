@@ -8,13 +8,13 @@ export const EMBED_MAX_TEXTS = 32;
 export const EMBED_MAX_CHARS = 8_000;
 export const EMBED_MAX_TOTAL_CHARS = 64_000;
 export const DEMO_EMBED_MODEL = "demo-hash-768";
-export const DEFAULT_EMBED_MODEL = "gemini-embedding-001";
+export const DEFAULT_EMBED_MODEL = "gemini-embedding-2";
 
 let warnedMissingKey = false;
 
 /** The model embed() uses for live vectors, so callers can compare it with stored `embedding_model`. */
 export function liveEmbedModel(): string {
-  return env().AI_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  return env().AI_EMBED_MODEL || DEFAULT_EMBED_MODEL;
 }
 
 /** Scale to unit length. A zero vector is returned unchanged. */
@@ -68,6 +68,7 @@ export async function embed(req: EmbedRequest): Promise<EmbedResult> {
     if (t.length > EMBED_MAX_CHARS) {
       throw new AiError(`Each text must be at most ${EMBED_MAX_CHARS} characters`, "input_rejected");
     }
+    if (t.trim() === "") throw new AiError("Texts must not be empty", "input_rejected");
     total += t.length;
   }
   if (total > EMBED_MAX_TOTAL_CHARS) {
