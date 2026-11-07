@@ -1,12 +1,9 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useActionState, useRef, useState, useTransition } from "react";
-import { signOut } from "@/lib/auth/client";
+import { DemoBadge } from "@/components/ui";
+import { buttonPrimary, buttonSecondary, inputClass } from "@/components/ui/styles";
 import { type ActionState, type SummaryState, addItemAction, summarizeAction } from "./actions";
-
-const input =
-  "w-full rounded-card border border-border bg-surface px-3 py-2 text-base outline-none focus:border-accent";
 
 export function AddItemForm() {
   const formRef = useRef<HTMLFormElement>(null);
@@ -18,77 +15,67 @@ export function AddItemForm() {
 
   return (
     <form ref={formRef} action={action} className="space-y-3">
-      <input name="title" placeholder="Title" required maxLength={200} className={input} />
-      <textarea name="body" placeholder="Details (optional)" rows={2} maxLength={5000} className={input} />
+      <label className="block space-y-1 text-sm font-medium">
+        <span>Title</span>
+        <input name="title" required maxLength={200} className={inputClass} />
+      </label>
+      <label className="block space-y-1 text-sm font-medium">
+        <span>Details (optional)</span>
+        <textarea name="body" rows={2} maxLength={5000} className={inputClass} />
+      </label>
       {state.error && (
-        <p role="alert" className="text-sm text-danger">
+        <p role="alert" className="text-sm font-medium text-danger">
           {state.error}
         </p>
       )}
-      <button
-        type="submit"
-        disabled={pending}
-        className="rounded-card bg-accent px-4 py-2 text-sm font-medium text-accent-foreground disabled:opacity-60"
-      >
+      <button type="submit" disabled={pending} className={buttonPrimary}>
         {pending ? "Adding…" : "Add item"}
       </button>
     </form>
   );
 }
 
+/** The AI result area: idle, pending, error and answer states, with the demo label when the answer is recorded. */
 export function SummaryPanel() {
   const [state, setState] = useState<SummaryState | null>(null);
   const [pending, startTransition] = useTransition();
 
   return (
-    <section className="space-y-3 rounded-card border border-border bg-surface p-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="font-medium">AI summary</h2>
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
           disabled={pending}
           onClick={() => startTransition(async () => setState(await summarizeAction()))}
-          className="rounded-card border border-border px-3 py-1.5 text-sm font-medium disabled:opacity-60"
+          className={buttonSecondary}
         >
           {pending ? "Summarizing…" : "Summarize my items"}
         </button>
+        {state?.demo && !pending && <DemoBadge label="Demo answer" />}
       </div>
-      {state?.error && <p className="text-sm text-danger">{state.error}</p>}
-      {state?.summary && (
-        <div className="space-y-2 text-sm">
-          <p>{state.summary}</p>
-          {state.highlights && state.highlights.length > 0 && (
-            <ul className="list-disc space-y-1 pl-5 text-muted">
-              {state.highlights.map((h) => (
-                <li key={h}>{h}</li>
-              ))}
-            </ul>
-          )}
-          {state.demo && (
-            <p className="text-xs text-muted">Demo answer: the live model is off or over its free quota.</p>
-          )}
-        </div>
-      )}
-      {!state && (
-        <p className="text-sm text-muted">Generates a short summary of your items with the app&apos;s model.</p>
-      )}
-    </section>
-  );
-}
-
-export function SignOutButton() {
-  const router = useRouter();
-  return (
-    <button
-      type="button"
-      onClick={async () => {
-        await signOut();
-        router.push("/sign-in");
-        router.refresh();
-      }}
-      className="rounded-card border border-border px-3 py-1.5 text-sm"
-    >
-      Sign out
-    </button>
+      <div aria-live="polite">
+        {pending && <p className="text-sm text-muted">Working on it…</p>}
+        {!pending && state?.error && (
+          <p role="alert" className="text-sm font-medium text-danger">
+            {state.error}
+          </p>
+        )}
+        {!pending && state?.summary && (
+          <div className="space-y-2">
+            <p>{state.summary}</p>
+            {state.highlights && state.highlights.length > 0 && (
+              <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
+                {state.highlights.map((h) => (
+                  <li key={h}>{h}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+        {!pending && !state && (
+          <p className="text-sm text-muted">Generates a short summary of your items with the app&apos;s model.</p>
+        )}
+      </div>
+    </div>
   );
 }
