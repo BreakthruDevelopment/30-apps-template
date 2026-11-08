@@ -133,6 +133,29 @@ describe.skipIf(!url)("admin permissions (Better Auth + Postgres)", () => {
     );
   });
 
+  it("refuses list-user-sessions (raw tokens, IPs, user agents) over HTTP and by role", async () => {
+    const res = await handler(
+      new Request(`http://localhost:3000/api/auth/admin/list-user-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie: adminCookie },
+        body: JSON.stringify({ userId: victimId }),
+      }),
+    );
+    expect([403, 404]).toContain(res.status);
+    await expect(
+      authApi.listUserSessions({
+        headers: new Headers({ cookie: adminCookie }),
+        body: { userId: victimId },
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("reports impersonate as not permitted for admins via has-permission", async () => {
+    const res = await call("/admin/has-permission", { permissions: { user: ["impersonate"] } }, adminCookie);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { success: boolean }).success).toBe(false);
+  });
+
   it("does not let a plain user use admin endpoints", async () => {
     const res = await call("/admin/set-role", { userId: victimId, role: "admin" }, userCookie);
     expect(res.status).toBe(403);

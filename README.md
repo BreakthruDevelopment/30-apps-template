@@ -36,9 +36,11 @@ Next.js container ── pages, server actions, route handlers (/api/*)
 
 Two roles, `user` and `admin`, via Better Auth's admin plugin. **Admins manage accounts but never act as users:**
 `src/lib/auth/permissions.ts` gives `admin` create, list, get, update, set-role, ban and delete on users plus
-session list/revoke/delete, and withholds `impersonate`, `impersonate-admins`, `set-password` and `set-email`
-(Better Auth's default admin role includes them). `/admin/impersonate-user`, `/admin/stop-impersonating` and
-`/admin/set-user-password` are also in `disabledPaths`, so they return 404 even if a role is widened later.
+session revoke/delete. It withholds `impersonate`, `impersonate-admins`, `set-password` and `set-email`
+(Better Auth's default admin role includes them) and session `list`, which would expose other users' raw
+session tokens, IP addresses and user agents. `/admin/impersonate-user`, `/admin/stop-impersonating`,
+`/admin/set-user-password` and `/admin/list-user-sessions` are also in `disabledPaths`, so they return 404 even
+if a role is widened later. `update` lets an admin change another user's name and image (intended).
 Tests: `test/admin-permissions.integration.test.ts`. Don't add these permissions back; apps promise that admins
 see counts only.
 
