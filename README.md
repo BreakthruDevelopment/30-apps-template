@@ -32,6 +32,16 @@ Next.js container ── pages, server actions, route handlers (/api/*)
 | AI gateway | `src/lib/ai/` — input cap, JSON schema validation, demo fallback |
 | Health check | `GET /api/health` (503 if the database is down) |
 
+## Auth and roles
+
+Two roles, `user` and `admin`, via Better Auth's admin plugin. **Admins manage accounts but never act as users:**
+`src/lib/auth/permissions.ts` gives `admin` create, list, get, update, set-role, ban and delete on users plus
+session list/revoke/delete, and withholds `impersonate`, `impersonate-admins`, `set-password` and `set-email`
+(Better Auth's default admin role includes them). `/admin/impersonate-user`, `/admin/stop-impersonating` and
+`/admin/set-user-password` are also in `disabledPaths`, so they return 404 even if a role is widened later.
+Tests: `test/admin-permissions.integration.test.ts`. Don't add these permissions back; apps promise that admins
+see counts only.
+
 ## Run locally
 
 ```bash
