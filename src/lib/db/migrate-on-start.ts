@@ -10,7 +10,7 @@ const LOCK_ID = 7_301_330;
 /** Delays between attempts after a failure: covers a database that is still being created (about 1 to 2 minutes). */
 export const RETRY_DELAYS_MS = [5_000, 10_000, 15_000, 30_000, 30_000, 60_000, 60_000, 60_000, 120_000, 120_000];
 
-export type MigrationState = "skipped" | "running" | "ok" | "retrying" | "failed";
+export type MigrationState = "skipped" | "running" | "ok" | "retrying";
 
 // Instrumentation and route handlers can load separate copies of this module, so the state lives on globalThis.
 const KEY = Symbol.for("30apps.migrationState");
@@ -34,7 +34,10 @@ async function runMigrations(url: string): Promise<void> {
   const folder = process.env.MIGRATIONS_DIR ?? path.join(process.cwd(), "drizzle");
   const sql = postgres(url, { max: 1, connect_timeout: 10 });
   try {
+    // Don't wait forever on a lock held by a dead instance's session: time out and let the retry loop try again.
+    await sql`set lock_timeout = '30s'`;
     await sql`select pg_advisory_lock(${LOCK_ID})`;
+    await sql`reset lock_timeout`;
     try {
       await migrate(drizzle(sql), { migrationsFolder: folder });
     } finally {
@@ -48,17 +51,20 @@ async function runMigrations(url: string): Promise<void> {
 /**
  * Applies pending migrations. The first attempt runs before the server takes traffic. If it fails (for example a
  * brand-new app whose database the cloud is still creating), later attempts run in the background with backoff,
- * and /api/health answers 503 until one succeeds, so the platform and the Build Tracker see the app as not ready
- * instead of serving errors from missing tables.
+ * and /api/health answers 503 until one succeeds, so the Build Tracker sees the app as degraded. (No cloud probes
+ * /api/health, so the platform keeps routing traffic meanwhile.) Retries never stop: after the backoff list runs out
+ * they continue at its last delay, so an instance recovers whenever the database comes back.
  */
 export async function migrateOnStart(deps: Deps = {}): Promise<void> {
+  const current = migrationState();
+  if (current === "running" || current === "retrying") return;
   const url = process.env.DATABASE_URL;
   if (!url && !deps.runOnce) {
     log.warn("db.migrate.skipped", { reason: "DATABASE_URL not set" });
     setState("skipped");
     return;
   }
-  const runOnce = deps.runOnce ?? (() => runMigrations(url!));
+  const runOnce = deps.runOnce ?? (() => runMigrations(url as string));
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref?.()));
   const delays = deps.delays ?? RETRY_DELAYS_MS;
 
@@ -80,11 +86,10 @@ export async function migrateOnStart(deps: Deps = {}): Promise<void> {
   setState("retrying");
   // Don't block startup: health reports the state while retries run.
   void (async () => {
-    for (let i = 0; i < delays.length; i++) {
-      await sleep(delays[i]);
+    for (let i = 0; ; i++) {
+      await sleep(delays[Math.min(i, delays.length - 1)]);
       if (await attempt(i + 2)) return;
+      if (i === delays.length - 1) log.error("db.migrate.still_failing", { attempts: i + 2 }); // log once, keep trying
     }
-    setState("failed");
-    log.error("db.migrate.gave_up", { attempts: delays.length + 1 });
   })();
 }
