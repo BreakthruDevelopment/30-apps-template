@@ -47,13 +47,18 @@ export function geminiProvider(apiKey: string, model: string): AiProvider {
   return {
     name: "gemini",
     model,
-    async complete({ system, prompt, maxOutputTokens }) {
+    async complete({ system, prompt, maxOutputTokens, images }) {
       const json = (await post(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
         { "x-goog-api-key": apiKey },
         {
           systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          contents: [
+            {
+              role: "user",
+              parts: [...(images ?? []).map((i) => ({ inlineData: { mimeType: i.mimeType, data: i.data } })), { text: prompt }],
+            },
+          ],
           generationConfig: {
             responseMimeType: "application/json",
             maxOutputTokens,
@@ -73,7 +78,11 @@ export function anthropicProvider(apiKey: string, model: string): AiProvider {
   return {
     name: "anthropic",
     model,
-    async complete({ system, prompt, maxOutputTokens }) {
+    async complete({ system, prompt, maxOutputTokens, images }) {
+      // HEIC/HEIF are not supported by the Messages API; refuse before any network call.
+      if (images?.some((i) => i.mimeType === "image/heic" || i.mimeType === "image/heif")) {
+        throw new AiError("Anthropic does not accept HEIC/HEIF images", "input_rejected");
+      }
       const json = (await post(
         "https://api.anthropic.com/v1/messages",
         { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
@@ -81,7 +90,20 @@ export function anthropicProvider(apiKey: string, model: string): AiProvider {
           model,
           max_tokens: maxOutputTokens,
           system: `${system}\n\nRespond with JSON only, no prose and no code fences.`,
-          messages: [{ role: "user", content: prompt }],
+          messages: [
+            {
+              role: "user",
+              content: images?.length
+                ? [
+                    ...images.map((i) => ({
+                      type: "image",
+                      source: { type: "base64", media_type: i.mimeType, data: i.data },
+                    })),
+                    { type: "text", text: prompt },
+                  ]
+                : prompt,
+            },
+          ],
         },
       )) as { content?: { type: string; text?: string }[] };
       const text = json.content

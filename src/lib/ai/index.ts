@@ -1,11 +1,14 @@
 import { env } from "@/lib/env";
 import { log } from "@/lib/log";
 import { demoAnswer } from "./demo";
+import { validateImages } from "./images";
 import { anthropicProvider, geminiProvider } from "./providers";
 import { type AiProvider, type GenerateRequest, type GenerateResult, AiError } from "./types";
 
 export { AiError } from "./types";
-export type { EmbedRequest, EmbedResult, GenerateRequest, GenerateResult } from "./types";
+export { MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, IMAGE_MIME_TYPES } from "./images";
+export type {
+  AiImage, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult } from "./types";
 export { embed, liveEmbedModel, EMBED_DIMS, DEMO_EMBED_MODEL } from "./embed";
 
 /** Hard cap on what a user can send to a model, to bound cost and abuse. */
@@ -63,6 +66,8 @@ export async function generate<T>(req: GenerateRequest<T>): Promise<GenerateResu
   if (req.prompt.length > MAX_PROMPT_CHARS) {
     throw new AiError(`Input is longer than ${MAX_PROMPT_CHARS} characters`, "input_rejected");
   }
+  const imageStats = validateImages(req.images);
+  const imageLog = imageStats.count > 0 ? { images: imageStats.count, imageBytes: imageStats.bytes } : {};
   const e = env();
   const maxOutputTokens = req.maxOutputTokens ?? 800;
   const started = Date.now();
@@ -72,19 +77,24 @@ export async function generate<T>(req: GenerateRequest<T>): Promise<GenerateResu
     const parsed = req.schema.safeParse(extractJson(raw));
     if (!parsed.success) throw new AiError("Model output failed validation", "invalid_output");
     const latencyMs = Date.now() - started;
-    log.info("ai.generate", { task: req.task, provider: name, model, demo, latencyMs });
+    log.info("ai.generate", { task: req.task, provider: name, model, demo, latencyMs, ...imageLog });
     return { data: parsed.data, provider: name, model, demo, latencyMs };
   };
 
   if (!provider) return finish(demoAnswer(req.task), "demo", "recorded", true);
 
   try {
-    const raw = await provider.complete({ system: req.system, prompt: req.prompt, maxOutputTokens });
+    const raw = await provider.complete({
+      system: req.system,
+      prompt: req.prompt,
+      maxOutputTokens,
+      ...(req.images?.length ? { images: req.images } : {}),
+    });
     return finish(raw, provider.name, provider.model, false);
   } catch (err) {
     const kind = err instanceof AiError ? err.kind : "provider";
     const status = err instanceof AiError ? err.status : undefined;
-    log.warn("ai.generate.failed", { task: req.task, provider: provider.name, model: provider.model, kind, status });
+    log.warn("ai.generate.failed", { task: req.task, provider: provider.name, model: provider.model, kind, status, ...imageLog });
     if (e.AI_FALLBACK_TO_DEMO && kind !== "input_rejected") {
       return finish(demoAnswer(req.task), "demo", "recorded", true);
     }

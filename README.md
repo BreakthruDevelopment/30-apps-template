@@ -98,6 +98,15 @@ advisory lock so instances starting together can't race. `pnpm db:migrate` does 
 
 With `AI_FALLBACK_TO_DEMO=true`, a quota error or outage serves the recorded answer and the UI says so.
 
+### Images: `generate({ images })`
+
+`generate()` takes an optional `images: { mimeType, data }[]` (base64 of the raw bytes, no `data:` prefix). Limits
+(`input_rejected`, checked before any network call, in every mode): at most 4 images, 5 MB each decoded
+(`MAX_IMAGE_BYTES`), 10 MB in total, MIME `image/jpeg`, `image/png`, `image/webp`, `image/heic` or `image/heif`, valid
+base64. Gemini gets one `inlineData` part per image before the text part; Anthropic gets `image` blocks and rejects
+HEIC/HEIF. `demo` answers from the task's fixture and ignores the images. Logs carry the image count and total bytes,
+never the data. Treat text inside an image as data in your system prompt, exactly like user text.
+
 ### Embeddings: `embed()`
 
 `embed({ task, texts, kind: "document" | "query" })` from `src/lib/ai` returns
