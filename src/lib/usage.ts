@@ -10,6 +10,14 @@ export type Executor = Pick<Db, "select" | "insert" | "delete" | "execute">;
  * A transaction handle, and only that. The per-user advisory lock is transaction-scoped, so on a pool
  * handle each statement may run on a different connection and the lock protects nothing (20 parallel
  * calls got 19 through the limit). Typing these functions with `Tx` makes passing `db()` a type error.
+ *
+ * Two rules the type can't enforce:
+ * - The transaction must run at READ COMMITTED (Postgres's default; don't raise it). The count after the lock
+ *   must see rows committed by whoever held the lock first. Under REPEATABLE READ or SERIALIZABLE the snapshot
+ *   predates the lock and concurrent callers can all slip under the limit.
+ * - Keep the transaction short. The lock serializes this user's attempts and the transaction pins a pooled
+ *   connection. Never hold it across a slow call (an AI request, a fetch): consume or reserve in one small
+ *   transaction, commit, do the work, and call `releaseRate`/`releaseDaily` in a new transaction if it fails.
  */
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -29,6 +37,8 @@ export async function advisoryLock(tx: Tx, name: string): Promise<void> {
  * Returns false, changing nothing, when the cap is reached.
  */
 export async function reserveDaily(tx: Executor, kind: DailyKind, cap: number): Promise<boolean> {
+  // The conditional below only guards the update branch; a fresh day's first insert would otherwise get through.
+  if (!(cap >= 1)) return false;
   const rows = await tx.execute(sql`
     insert into daily_usage (day, kind, count) values (${today}, ${kind}, 1)
     on conflict (day, kind) do update set count = daily_usage.count + 1
@@ -75,6 +85,8 @@ export async function consumeRate(
 
 /** Undo one `consumeRate` (the newest row) when the work it paid for never happened. */
 export async function releaseRate(tx: Tx, userId: string, kind: RateKind): Promise<void> {
+  // Same lock as consumeRate: two concurrent refunds must not both pick the same newest row.
+  await advisoryLock(tx, `rate:${kind}:${userId}`);
   await tx.execute(sql`
     delete from rate_event where id = (
       select id from rate_event where user_id = ${userId} and kind = ${kind} order by at desc limit 1

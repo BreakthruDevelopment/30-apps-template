@@ -68,6 +68,21 @@ describe.skipIf(!url)("rate limits (Postgres)", () => {
     expect(await database.transaction((tx) => usage.reserveDaily(tx, "demo_load", 4))).toBe(false);
   });
 
+  it("reserveDaily with cap 0 (or less) never lets anything through, even on a fresh day", async () => {
+    await sql`delete from daily_usage where kind = 'ai'`;
+    expect(await database.transaction((tx) => usage.reserveDaily(tx, "ai", 0))).toBe(false);
+    expect(await database.transaction((tx) => usage.reserveDaily(tx, "ai", -1))).toBe(false);
+    expect(await usage.dailyCount("ai")).toBe(0);
+  });
+
+  it("concurrent releaseRate calls each refund one distinct attempt", async () => {
+    await sql`insert into "user" (id, name, email) values ('use-d', 'd', 'use-d@test.local') on conflict do nothing`;
+    for (let i = 0; i < 5; i++) await database.transaction((tx) => usage.consumeRate(tx, "use-d", "ai", 10, "slow"));
+    await Promise.all(Array.from({ length: 3 }, () => database.transaction((tx) => usage.releaseRate(tx, "use-d", "ai"))));
+    const [{ n }] = await sql`select count(*)::int as n from rate_event where user_id = 'use-d' and kind = 'ai'`;
+    expect(n).toBe(2);
+  });
+
   it("does not accept a pool handle (type-level)", () => {
     // @ts-expect-error a pool handle is not a transaction
     void (() => usage.consumeRate(database, "use-a", "api_write", 5, "x"));

@@ -28,13 +28,17 @@ export function demoSeedConfig(values: Record<string, string | undefined> = proc
   if (PRODUCTION_APP_HOSTS.some((h) => hostname === h || hostname.endsWith(`.${h}`))) {
     throw new Error("Demo seed refused: APP_URL is a production host.");
   }
-  const dbHost = databaseHost(values.DATABASE_URL);
-  // "postgres" is the compose service name on the Oracle VM, i.e. the production database.
-  if (dbHost === "postgres" || (dbHost && PRODUCTION_DB_HOST_SUFFIXES.some((s) => dbHost.endsWith(s)))) {
-    throw new Error("Demo seed refused: DATABASE_URL is a production database host.");
-  }
   // Cloud SQL sockets (`?host=/cloudsql/project:region:instance`) are the Google Cloud production database.
   if (values.DATABASE_URL && /(\/|%2f)cloudsql(\/|%2f)/i.test(values.DATABASE_URL)) {
+    throw new Error("Demo seed refused: DATABASE_URL is a production database host.");
+  }
+  // A URL we can't read is a URL we can't vet: an unencoded # or / in the password, a multi-host list, a typo.
+  const dbHost = databaseHost(values.DATABASE_URL);
+  if (values.DATABASE_URL && !dbHost) {
+    throw new Error("Demo seed refused: DATABASE_URL can't be parsed to a single host (percent-encode special characters in the password).");
+  }
+  // "postgres" is the compose service name on the Oracle VM, i.e. the production database.
+  if (dbHost === "postgres" || (dbHost && PRODUCTION_DB_HOST_SUFFIXES.some((s) => dbHost.endsWith(s)))) {
     throw new Error("Demo seed refused: DATABASE_URL is a production database host.");
   }
   const password = z.string().min(10).max(128).parse(values.DEMO_PASSWORD);
@@ -46,7 +50,8 @@ const normalizeHost = (h: string) => h.toLowerCase().replace(/\.+$/, "");
 function databaseHost(url: string | undefined): string | undefined {
   if (!url) return undefined;
   try {
-    return normalizeHost(new URL(url).hostname);
+    const host = normalizeHost(new URL(url).hostname);
+    return host && !host.includes(",") ? host : undefined; // an empty or multi-host value can't be vetted
   } catch {
     return undefined;
   }

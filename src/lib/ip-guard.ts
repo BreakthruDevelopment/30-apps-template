@@ -16,15 +16,17 @@ export function isPublicIp(address: string): boolean {
   return false;
 }
 
-function isPublicV4([a, b, c]: number[]): boolean {
+function isPublicV4([a, b, c, d]: number[]): boolean {
   if (a === 0) return false; // 0.0.0.0/8 unspecified / "this network"
   if (a === 10) return false; // RFC1918
   if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT 100.64/10
   if (a === 127) return false; // loopback
+  if (a === 168 && b === 63 && c === 129 && d === 16) return false; // Azure wireserver / host services
   if (a === 169 && b === 254) return false; // link-local, cloud metadata
   if (a === 172 && b >= 16 && b <= 31) return false; // RFC1918
   if (a === 192 && b === 0 && c === 0) return false; // IETF protocol assignments
   if (a === 192 && b === 0 && c === 2) return false; // TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return false; // 6to4 relay anycast (deprecated)
   if (a === 192 && b === 168) return false; // RFC1918
   if (a === 198 && (b === 18 || b === 19)) return false; // benchmarking
   if (a === 198 && b === 51 && c === 100) return false; // TEST-NET-2
@@ -63,6 +65,10 @@ function isPublicV6(g: number[]): boolean {
   if ((g[0] & 0xe000) !== 0x2000) return false;
   if (g[0] === 0x2001 && g[1] === 0x0db8) return false; // documentation
   if (g[0] === 0x2001 && g[1] === 0) return false; // Teredo
+  if (g[0] === 0x2001 && g[1] === 2 && g[2] === 0) return false; // 2001:2::/48 benchmarking
+  if (g[0] === 0x2001 && (g[1] & 0xfff0) === 0x10) return false; // 2001:10::/28 ORCHID (deprecated)
+  if (g[0] === 0x2001 && (g[1] & 0xfff0) === 0x20) return false; // 2001:20::/28 ORCHIDv2
+  if (g[0] === 0x3fff && (g[1] & 0xf000) === 0) return false; // 3fff::/20 documentation
   if (g[0] === 0x2002) return isPublicV4(v4From(g[1], g[2])); // 6to4 embeds an IPv4 address
   return true;
 }

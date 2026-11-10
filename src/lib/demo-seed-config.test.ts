@@ -54,6 +54,22 @@ describe("demoSeedConfig", () => {
   });
 });
 
+describe("demoSeedConfig (unreadable DATABASE_URL)", () => {
+  it.each([
+    "postgres://u:pa#ss@postgres:5432/app", // unencoded # truncates the URL
+    "postgres://u:p@a.example,b.example:5432/app", // multi-host list
+    "postgres://u:p@h1:5432,h2:5432/app",
+    "postgres://u:p@/app?host=/var/run/postgresql", // no host to vet
+    "not a url",
+  ])("refuses %s", (DATABASE_URL) => {
+    expect(() => demoSeedConfig({ ...ok, DATABASE_URL })).toThrow(/DATABASE_URL/);
+  });
+
+  it("still allows no DATABASE_URL at all (the loader will fail on its own)", () => {
+    expect(() => demoSeedConfig({ ...ok, DATABASE_URL: undefined })).not.toThrow();
+  });
+});
+
 describe("isDemoEmail", () => {
   it("matches the demo domain only", () => {
     expect(isDemoEmail("ada@demo.breakthru.test")).toBe(true);

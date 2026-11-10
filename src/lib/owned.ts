@@ -2,10 +2,11 @@ import { type SQL, and, eq } from "drizzle-orm";
 import type { PgColumn } from "drizzle-orm/pg-core";
 
 /**
- * Ownership, once. Habits, check-ins, settings, devices and summaries are private to their owner,
- * admin included, so the template's `can()` (admin passes everything) is deliberately not used for
- * them. Every select, update and delete of those tables goes through this fragment; zero rows
- * means 404. Tables key the owner as `ownerId` (habit, check_in) or `userId` (the per-user tables).
+ * Ownership, once. For tables whose rows are private to their owner, admin included, so `can()` (which lets admin
+ * through) is deliberately not used. Put this fragment in every select, update and delete of such a table; extra
+ * conditions are ANDed in. It only filters: when it matches zero rows the caller turns that into
+ * `NotFoundError` (404, so a stranger can't tell a missing row from someone else's). Tables key the owner as
+ * `ownerId` or `userId`.
  */
 export function ownedBy(
   table: { ownerId: PgColumn } | { userId: PgColumn },
