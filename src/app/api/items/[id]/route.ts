@@ -1,12 +1,14 @@
 import { requireUser } from "@/lib/auth/session";
+import { requireSameOrigin } from "@/lib/csrf";
 import { errorResponse } from "@/lib/http";
 import { deleteItem } from "@/lib/items";
 
 export const dynamic = "force-dynamic";
 
 /** DELETE /api/items/:id — owners delete their own items; admins delete any. */
-export async function DELETE(_request: Request, ctx: { params: Promise<{ id: string }> }) {
+export async function DELETE(request: Request, ctx: { params: Promise<{ id: string }> }) {
   try {
+    requireSameOrigin(request);
     const user = await requireUser();
     const { id } = await ctx.params;
     const deleted = await deleteItem(user, id);

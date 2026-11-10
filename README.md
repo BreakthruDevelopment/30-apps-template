@@ -81,6 +81,24 @@ The header links come from `NAV_LINKS` in `src/lib/app-config.ts`; each app must
 Shared button and field classes are in `src/components/ui/styles.ts` (44px minimum height). Don't add `loading.tsx` or
 `<Suspense>` above a page that calls `requireRoleOrRedirect()` or `notFound()`.
 
+## Shared helpers
+
+Small, self-contained files every app has needed. Copy the ones you use (with their tests); each imports only from
+the paths named here. Authorization still lives in `src/lib/auth/rbac.ts` and your data functions.
+
+| File | Use it when |
+| --- | --- |
+| `src/lib/errors.ts` | You throw a domain error from a data function: `NotFoundError` (404), `ConflictError` (409), `BadRequestError` (400), `TooManyRequestsError` (429), `PayloadTooLargeError` (413), `UnprocessableError` (422). `errorResponse` maps them. |
+| `src/lib/http.ts` | Every route handler: `errorResponse(err)` and `readJson(request, maxBytes)` (capped read, 413 or 400 on bad bodies). `readBodyCapped` for uploads. |
+| `src/lib/safe-error.ts` | You log an error. `safeErrorFields(err)` drops database query parameters (emails, note text); never log `err.message` of a database error yourself. |
+| `src/lib/csrf.ts` | A cookie-authenticated POST, PATCH or DELETE route handler: call `requireSameOrigin(request)` first. |
+| `src/lib/owned.ts` | A table is private to its owner, admin included: `ownedBy(table, actor, ...conditions)` in every select, update and delete; zero rows means 404. |
+| `src/lib/usage.ts` + `rate_event`, `daily_usage` tables | You cap a user's attempts (`consumeRate`, sliding window, inside `db().transaction`) or an app-wide daily budget (`reserveDaily`). List your kinds in `schema.ts` (`RATE_KINDS`, `DAILY_USAGE_KINDS`) and add a migration. |
+| `src/lib/magic.ts` | You accept an upload: `matchesMagic(type, bytes)` for PDF, PNG, JPEG, WebP. Never trust the Content-Type header. |
+| `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL: resolve the host and refuse unless `isPublicIp(address)` for every address (SSRF guard). |
+| `src/lib/db/migrate-on-start.ts` | Already wired by `instrumentation.ts`. Background work that needs the schema awaits `whenMigrated()` first. |
+| `src/lib/demo-identity.ts`, `src/lib/demo-seed-config.ts` | The app has a demo workspace: `demoSeedConfig()` runs first in `scripts/seed-demo.mts` and refuses production hosts and databases; `isDemoEmail` and `MARKER` stop public sign-ups faking a demo user. Set `MARKER` per app. |
+
 ## Checks
 
 ```bash
