@@ -62,7 +62,7 @@ function loop(provider: AiProvider, tools: ReturnType<typeof defineTool>[], extr
       maxOutputTokens: 300,
       tools,
       maxSteps: extra.maxSteps ?? 4,
-      deadlineMs: extra.deadlineMs ?? 5000,
+      deadlineAt: Date.now() + (extra.deadlineMs ?? 5000),
       history: [{ role: "user", text: "find setup items" }],
     },
     provider,
@@ -249,6 +249,15 @@ describe("tool loop", () => {
     await expect(loop(provider, [tool], { deadlineMs: 100 }).promise).rejects.toMatchObject({ kind: "tool_loop", status: "timeout" });
   });
 
+  it("treats a native timeout at the deadline (e.g. a stalled response body) as tool_loop/timeout", async () => {
+    const { tool } = search();
+    const { provider } = stub(async () => {
+      await new Promise((r) => setTimeout(r, 70));
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    });
+    await expect(loop(provider, [tool], { deadlineMs: 60 }).promise).rejects.toMatchObject({ kind: "tool_loop", status: "timeout" });
+  });
+
   it("rejects bad tool definitions before any model call", async () => {
     const { provider, requests } = stub(() => turn([]));
     const mk = (name: string) => defineTool({ name, description: "x", args: z.object({}), kind: "read", run: async () => null });
@@ -428,6 +437,42 @@ describe("generate() with tools", () => {
     setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
     const result = await generate(req);
     expect(result.demo).toBe(true);
+  });
+
+  it("maps a response body that stalls past the deadline to tool_loop/timeout, with no demo fallback", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
+    const { run, tool } = items();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        status: 200,
+        ok: true,
+        json: () => new Promise((_, reject) => setTimeout(() => reject(new DOMException("timeout", "TimeoutError")), 80)),
+      }),
+    );
+    await expect(
+      generate({ task: "items-assistant", system: "s", prompt: "p", schema: answer, tools: [tool], deadlineMs: 60 }),
+    ).rejects.toMatchObject({ kind: "tool_loop", status: "timeout" });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("shares one deadline with the demo fallback", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" }); // fallback on
+    const run = vi.fn(() => new Promise<unknown[]>((r) => setTimeout(() => r([]), 150)));
+    const tool = defineTool({ name: "search_items", description: "x", args: z.object({ query: z.string().min(1) }), kind: "read", run });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, 100));
+        return new Response("{}", { status: 500 });
+      }),
+    );
+    const started = Date.now();
+    // 100 ms in the live attempt + a 150 ms handler in the demo path must not fit a 200 ms budget.
+    await expect(
+      generate({ task: "items-assistant", system: "s", prompt: "p", schema: answer, tools: [tool], deadlineMs: 200 }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(Date.now() - started).toBeLessThan(260);
   });
 
   it("does not fall back to the demo when the loop itself is exhausted", async () => {

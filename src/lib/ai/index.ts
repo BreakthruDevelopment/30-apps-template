@@ -134,7 +134,7 @@ async function generateWithTools<T>(req: Extract<GenerateRequest<T>, { tools: un
     maxOutputTokens: req.maxOutputTokens ?? 800,
     tools: req.tools,
     maxSteps,
-    deadlineMs,
+    deadlineAt: Date.now() + deadlineMs,
     history,
     demoContext: req.demoContext,
   };

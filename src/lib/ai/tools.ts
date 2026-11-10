@@ -61,7 +61,8 @@ type LoopRequest<T> = {
   maxOutputTokens: number;
   tools: AnyToolDef[];
   maxSteps: number;
-  deadlineMs: number;
+  /** Absolute epoch ms for the whole call, shared by the live loop and a demo fallback. */
+  deadlineAt: number;
   history: ToolHistoryItem[];
   demoContext?: unknown;
 };
@@ -70,6 +71,10 @@ export type { LoopRequest as ToolLoopRequest };
 
 function timeoutError(): AiError {
   return new AiError("Tool loop ran out of time", "tool_loop", "timeout");
+}
+
+function isTimeout(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
 }
 
 function jsonSchemaOf(schema: z.ZodType, io: "input" | "output", what: string): Record<string, unknown> {
@@ -188,9 +193,8 @@ export async function runToolLoop<T>(req: LoopRequest<T>, provider: AiProvider, 
   if (!provider.step) throw new AiError("This provider does not support tools", "input_rejected");
   const { byName, declarations } = prepareTools(req.tools, req.schema);
   const system = `${req.system}\n\n${TOOL_SYSTEM_SUFFIX}`;
-  const startedAt = Date.now();
-  const deadlineAt = startedAt + req.deadlineMs;
-  const signal = AbortSignal.timeout(req.deadlineMs);
+  const deadlineAt = req.deadlineAt;
+  const signal = AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()));
   const history = [...req.history];
 
   for (let step = 1; step <= req.maxSteps; step++) {
@@ -208,7 +212,7 @@ export async function runToolLoop<T>(req: LoopRequest<T>, provider: AiProvider, 
         deadlineAt,
       });
     } catch (err) {
-      if (err instanceof AiError && err.status === "timeout" && Date.now() >= deadlineAt - 50) throw timeoutError();
+      if (Date.now() >= deadlineAt - 50 && (isTimeout(err) || (err instanceof AiError && err.status === "timeout"))) throw timeoutError();
       throw err;
     }
 
@@ -274,7 +278,7 @@ export async function runDemoToolLoop<T>(req: LoopRequest<T>, trace: ToolTrace):
   if (script.steps.length > req.maxSteps - 1) {
     throw new Error(`Demo script for "${req.task}" has ${script.steps.length} steps; maxSteps ${req.maxSteps} leaves room for ${req.maxSteps - 1}.`);
   }
-  const signal = AbortSignal.timeout(req.deadlineMs);
+  const signal = AbortSignal.timeout(Math.max(1, req.deadlineAt - Date.now()));
   const results: DemoToolResult[] = [];
   for (const [i, step] of script.steps.entries()) {
     trace.steps = i + 1;

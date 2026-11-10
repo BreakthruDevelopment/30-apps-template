@@ -31,7 +31,15 @@ async function post(url: string, headers: Record<string, string>, body: unknown,
     // Never echo the response body: it can contain request details.
     throw new AiError(`Model provider returned HTTP ${res.status}`, "provider", res.status);
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (err) {
+    // A body that stalls past the deadline rejects with the native timeout, not from postOnce().
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new AiError("Model provider timed out", "provider", "timeout");
+    }
+    throw err;
+  }
 }
 
 /**

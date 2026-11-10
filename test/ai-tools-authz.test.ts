@@ -47,7 +47,7 @@ async function run(actor: Actor, askFor: string) {
   };
   const trace: ToolTrace = { steps: 0, calls: [] };
   await runToolLoop(
-    { task: "t", system: "s", schema: z.object({ reply: z.string() }), maxOutputTokens: 100, tools: [tool], maxSteps: 4, deadlineMs: 2000, history: [{ role: "user", text: "hi" }] },
+    { task: "t", system: "s", schema: z.object({ reply: z.string() }), maxOutputTokens: 100, tools: [tool], maxSteps: 4, deadlineAt: Date.now() + 2000, history: [{ role: "user", text: "hi" }] },
     provider,
     trace,
   );
