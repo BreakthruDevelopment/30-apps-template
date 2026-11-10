@@ -8,6 +8,10 @@ import { type Db, schema } from "@/lib/db";
  * `claim`, `complete` and `fail`. Authorization is the caller's: `enqueue` and `retryJob` are called from your
  * own data functions after `assertCan()`, and `retryJob` takes an `ownerId` so a user can't retry someone else's job.
  *
+ * Keys: (`kind`, `key`) is unique across ALL users, so a key must be something globally unique such as a row id (uuid).
+ * Never use a value two users could share (a URL, a name): the second user's `enqueue` would get the first user's job id
+ * back (`created: false`) and the job would run once, for the first. If the same input must run per user, put the owner in the key.
+ *
  * Every function takes a handle: `db()` or a transaction. Enqueue inside the transaction that saves the thing the job
  * is about, so a rolled-back save leaves no job. Never hold a transaction across a handler.
  */
@@ -25,6 +29,16 @@ export function backoffMs(failedAttempts: number): number {
 
 const MAX_PAYLOAD_BYTES = 4_096;
 
+/** Size of the JSON form, or Infinity when it can't be serialized (circular, BigInt, a toJSON that throws, nothing to write). */
+function serializedSize(value: unknown): number {
+  try {
+    const json = JSON.stringify(value);
+    return typeof json === "string" ? Buffer.byteLength(json) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
 const enqueueSchema = z.object({
   kind: z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/),
   /** One queued or running job per (kind, key). Omit it to allow duplicates. */
@@ -33,7 +47,7 @@ const enqueueSchema = z.object({
   /** Ids and small parameters only: no personal data, no secrets. */
   payload: z
     .record(z.string(), z.unknown())
-    .refine((p) => Buffer.byteLength(JSON.stringify(p)) <= MAX_PAYLOAD_BYTES, "payload too large")
+    .refine((p) => serializedSize(p) <= MAX_PAYLOAD_BYTES, "payload must be JSON-serializable and at most 4 KB")
     .default({}),
   delayMs: z.number().int().min(0).max(7 * 86_400_000).default(0),
   maxAttempts: z.number().int().min(1).max(10).default(DEFAULT_MAX_ATTEMPTS),
@@ -83,10 +97,12 @@ export type ClaimedJob = {
   /** 1 on the first run. */
   attempts: number;
   maxAttempts: number;
+  deferrals: number;
   /** Proves this claim is current; `complete` and `fail` do nothing once the lease was reclaimed. */
   lockToken: string;
 };
 
+const UUID = z.uuid();
 const inList = (values: readonly string[]) => sql.join(values.map((v) => sql`${v}`), sql`, `);
 
 /**
@@ -95,8 +111,11 @@ const inList = (values: readonly string[]) => sql.join(values.map((v) => sql`${v
  * so no transaction stays open while the handler runs. Due means queued with `run_after` passed, or running with an
  * expired lease (the worker died or its instance scaled in) and attempts left.
  */
-export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit: number; leaseMs: number }): Promise<ClaimedJob[]> {
+export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit: number; leaseMs: number; ids?: readonly string[] }): Promise<ClaimedJob[]> {
   if (opts.kinds.length === 0 || opts.limit < 1) return [];
+  if (opts.ids && opts.ids.length === 0) return [];
+  const onlyIds = opts.ids ? sql`and id in (${inList(opts.ids.filter((id) => UUID.safeParse(id).success))})` : sql``;
+  if (opts.ids && opts.ids.every((id) => !UUID.safeParse(id).success)) return [];
   const rows = await tx.execute<{
     id: string;
     kind: string;
@@ -105,11 +124,12 @@ export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit:
     payload: Record<string, unknown>;
     attempts: number;
     max_attempts: number;
+    deferrals: number;
     lock_token: string;
   }>(sql`
     with picked as materialized (
       select id from job
-      where kind in (${inList(opts.kinds)})
+      where kind in (${inList(opts.kinds)}) ${onlyIds}
         and ((status = 'queued' and run_after <= now())
           or (status = 'running' and locked_until < now() and attempts < max_attempts))
       order by run_after, created_at
@@ -119,7 +139,7 @@ export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit:
     update job set status = 'running', attempts = job.attempts + 1, locked_until = now() + ${secs(opts.leaseMs)},
       lock_token = gen_random_uuid(), updated_at = now()
     from picked where job.id = picked.id
-    returning job.id, job.kind, job.key, job.owner_id, job.payload, job.attempts, job.max_attempts, job.lock_token
+    returning job.id, job.kind, job.key, job.owner_id, job.payload, job.attempts, job.max_attempts, job.deferrals, job.lock_token
   `);
   return rows.map((r) => ({
     id: r.id,
@@ -129,6 +149,7 @@ export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit:
     payload: r.payload,
     attempts: r.attempts,
     maxAttempts: r.max_attempts,
+    deferrals: r.deferrals,
     lockToken: r.lock_token,
   }));
 }
@@ -161,12 +182,19 @@ export async function complete(tx: Handle, j: ClaimedJob): Promise<boolean> {
   return rows.length > 0;
 }
 
+export const MAX_DEFERRALS = 20;
+export const MIN_DEFER_MS = 1_000;
+export const MAX_DEFER_MS = 3_600_000;
+
 export type FailOptions = {
   /** Short code stored in `last_error` (`[a-z0-9_]`, max 40). Never a message. */
   code: string;
   /** Don't retry: go straight to `failed`. */
   permanent?: boolean;
-  /** Retry after this long without using up an attempt (for example "the host is busy, try in 5 s"). */
+  /**
+   * Retry after this long (clamped to 1 s to 1 h) without using up an attempt, for example "the host is busy, try in
+   * 5 s". At most 20 times per job; after that, or when this isn't a finite number, it is an ordinary failed attempt.
+   */
   deferMs?: number;
 };
 
@@ -176,16 +204,17 @@ export type FailOptions = {
  */
 export async function fail(tx: Handle, j: ClaimedJob, opts: FailOptions): Promise<"queued" | "failed" | null> {
   const code = /^[a-z0-9_]{1,40}$/.test(opts.code) ? opts.code : "error";
-  const deferred = opts.deferMs !== undefined && !opts.permanent;
+  const deferred = !opts.permanent && Number.isFinite(opts.deferMs) && j.deferrals < MAX_DEFERRALS;
   const exhausted = opts.permanent === true || (!deferred && j.attempts >= j.maxAttempts);
   const next = exhausted ? "failed" : "queued";
-  const delay = deferred ? (opts.deferMs as number) : backoffMs(j.attempts);
+  const delay = deferred ? Math.min(Math.max(opts.deferMs as number, MIN_DEFER_MS), MAX_DEFER_MS) : backoffMs(j.attempts);
   const rows = await tx
     .update(job)
     .set({
       status: next,
       attempts: deferred ? Math.max(j.attempts - 1, 0) : j.attempts,
-      runAfter: exhausted ? sql`${job.runAfter}` : sql`now() + ${secs(Math.max(0, delay))}`,
+      deferrals: deferred ? sql`${job.deferrals} + 1` : sql`${job.deferrals}`,
+      runAfter: exhausted ? sql`${job.runAfter}` : sql`now() + ${secs(delay)}`,
       lastError: code,
       lockedUntil: null,
       lockToken: null,
@@ -198,21 +227,39 @@ export async function fail(tx: Handle, j: ClaimedJob, opts: FailOptions): Promis
 }
 
 /**
- * Manual Retry for a failed job, found by id or by (kind, key). Resets attempts and runs it as soon as a worker is
- * free (call `kick()` after). Pass `ownerId` to refuse other users' jobs. Returns `not_found` when no failed job
- * matches, `already_active` when a newer job with the same key is queued or running.
+ * Manual Retry for a failed job, found by id or by (kind, key). Only the newest job for its key can be retried: when a
+ * newer one exists (the user saved again) this answers `already_active` if it is queued or running and `not_found`
+ * otherwise. Resets attempts and runs at once (call `kick()` after). Pass `ownerId` to refuse other users' jobs; an
+ * unknown, malformed or foreign id is `not_found`.
+ *
+ * Call it with `db()`, not inside a transaction you need afterwards: in the rare race where two retries (or a save)
+ * activate the same key at once, Postgres rejects one with a unique violation, which this catches and reports as
+ * `already_active`, but that aborts the surrounding transaction.
  */
 export async function retryJob(
   tx: Handle,
   which: { id: string } | { kind: string; key: string },
   opts: { ownerId?: string } = {},
 ): Promise<"retried" | "not_found" | "already_active"> {
-  const where = "id" in which ? sql`id = ${which.id}` : sql`kind = ${which.kind} and key = ${which.key}`;
+  if ("id" in which && !UUID.safeParse(which.id).success) return "not_found";
   const owner = opts.ownerId !== undefined ? sql`and owner_id = ${opts.ownerId}` : sql``;
+  const [target] = await tx.execute<{ id: string; kind: string; key: string | null; status: string }>(
+    "id" in which
+      ? sql`select id, kind, key, status from job where id = ${which.id} ${owner}`
+      : sql`select id, kind, key, status from job where kind = ${which.kind} and key = ${which.key} ${owner} order by created_at desc limit 1`,
+  );
+  if (!target) return "not_found";
+  if (target.key !== null) {
+    const [newest] = await tx.execute<{ id: string; status: string }>(
+      sql`select id, status from job where kind = ${target.kind} and key = ${target.key} order by created_at desc limit 1`,
+    );
+    if (newest.id !== target.id) return newest.status === "queued" || newest.status === "running" ? "already_active" : "not_found";
+  }
+  if (target.status !== "failed") return "not_found";
   try {
     const rows = await tx.execute(sql`
-      update job set status = 'queued', attempts = 0, run_after = now(), last_error = null, finished_at = null, updated_at = now()
-      where id = (select id from job where ${where} ${owner} and status = 'failed' order by created_at desc limit 1)
+      update job set status = 'queued', attempts = 0, deferrals = 0, run_after = now(), last_error = null, finished_at = null, updated_at = now()
+      where id = ${target.id} and status = 'failed'
       returning id
     `);
     return rows.length > 0 ? "retried" : "not_found";

@@ -7,6 +7,7 @@ CREATE TABLE "job" (
 	"status" text DEFAULT 'queued' NOT NULL,
 	"attempts" integer DEFAULT 0 NOT NULL,
 	"max_attempts" integer DEFAULT 4 NOT NULL,
+	"deferrals" integer DEFAULT 0 NOT NULL,
 	"run_after" timestamp (3) with time zone DEFAULT now() NOT NULL,
 	"locked_until" timestamp (3) with time zone,
 	"lock_token" uuid,
@@ -15,7 +16,7 @@ CREATE TABLE "job" (
 	"updated_at" timestamp (3) with time zone DEFAULT now() NOT NULL,
 	"finished_at" timestamp (3) with time zone,
 	CONSTRAINT "job_status_chk" CHECK ("job"."status" in ('queued', 'running', 'done', 'failed')),
-	CONSTRAINT "job_attempts_chk" CHECK ("job"."attempts" >= 0 and "job"."max_attempts" >= 1)
+	CONSTRAINT "job_attempts_chk" CHECK ("job"."attempts" >= 0 and "job"."max_attempts" >= 1 and "job"."deferrals" >= 0)
 );
 --> statement-breakpoint
 ALTER TABLE "job" ADD CONSTRAINT "job_owner_id_user_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint

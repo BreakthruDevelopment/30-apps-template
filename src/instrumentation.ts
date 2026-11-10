@@ -11,17 +11,9 @@ export async function register() {
     await migrateOnStart();
   }
   // Not awaited: while migrations retry in the background the server must still start.
+  const { startJobs } = await import("./lib/jobs/start");
   startJobs().catch(async (err) => {
     const [{ log }, { safeErrorFields }] = await Promise.all([import("./lib/log"), import("./lib/safe-error")]);
     log.error("jobs.start_failed", safeErrorFields(err));
   });
-}
-
-async function startJobs() {
-  const { whenMigrated } = await import("./lib/db/migrate-on-start");
-  await whenMigrated();
-  const { handlers } = await import("./lib/jobs/handlers");
-  if (Object.keys(handlers).length === 0) return;
-  const { startWorker } = await import("./lib/jobs/worker");
-  startWorker({ handlers });
 }

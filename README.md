@@ -155,20 +155,28 @@ const { id, created } = await db().transaction(async (tx) => {
   // ...insert the link...
   return enqueue(tx, { kind: "fetch-link", key: link.id, ownerId: actor.id, payload: { linkId: link.id } });
 });
-after(() => kick()); // route handlers and server actions; runs the due jobs now
+after(() => kick()); // timer mode (Azure, Oracle): route handlers and server actions; runs the due jobs now
+// Inline mode (Lambda, Cloud Run): there is no CPU after the response, so do it before responding:
+// await kick({ budgetMs: 15_000, ids: [id] });
 
 // 3. On every signed-in request (requireUser / requireUserOrRedirect, or middleware): at most one claim per 10 s per process.
-nudge(); // returns false when throttled; never waits, never throws
+nudge(); // returns false when throttled (and always in inline mode); never waits, never throws
+// Inline mode drains old jobs the same way, inside the request and within its budget: await kick({ budgetMs: 5_000 });
 
 // 4. Status for a chip or poll endpoint (the payload is never returned), and manual Retry for a failed job.
 const status = await jobStatus(db(), { kind: "fetch-link", key: link.id, ownerId: actor.id });
 // status.state: queued | retrying | running | done | failed; retryInSeconds, attempts, maxAttempts, lastError (a code)
 await retryJob(db(), { kind: "fetch-link", key: link.id }, { ownerId: actor.id }); // "retried" | "not_found" | "already_active"
-after(() => kick());
+after(() => kick()); // or await kick({ budgetMs }) in inline mode
 ```
 
-`instrumentation.ts` starts the worker after `whenMigrated()` once `handlers` has an entry, so a template with no handlers
-runs no timer. Set `JOBS_WORKER=off` to turn the worker (and `kick`/`nudge`) off in tests and scripts.
+`instrumentation.ts` starts the worker (`startJobs()` in `src/lib/jobs/start.ts`) after `whenMigrated()` once `handlers` has an
+entry, so a template with no handlers runs no timer. `JOBS_WORKER` picks the mode: `timer` (default), `inline` (also chosen
+automatically when `AWS_LAMBDA_FUNCTION_NAME` is set), or `off` for tests and scripts, which turns the worker, `kick` and `nudge` off.
+
+**Keys.** (`kind`, `key`) is unique across all users, so make `key` a globally unique value such as a row id (uuid). Never use
+something two users can share, like a URL: the second user's `enqueue` would return the first user's job (`created: false`) and
+the job would run once, for the first. If the same input must run per user, put the owner in the key.
 
 **How it behaves**
 
@@ -178,7 +186,9 @@ runs no timer. Set `JOBS_WORKER=off` to turn the worker (and `kick`/`nudge`) off
   that was too slow (its lease was reclaimed) can't overwrite the new run.
 - **Limits per process.** `concurrency` 2 jobs at once, each time-boxed to `timeoutMs` 25 s (its `signal` aborts; the timeout
   must stay shorter than the 60 s lease, which `createWorker` enforces, so no heartbeat is needed). The worker ticks every 10 s.
-- **Retries.** A failed attempt backs off 15 s, 1 min, 4 min; the 4th failure sets `failed` (`maxAttempts` per job, default 4),
+- **Retries.** A handler can `throw new JobError(code, { permanent?, deferMs? })`. Codes must match `[a-z0-9_]{1,40}` (anything else
+  becomes `error`), so only safe strings reach the log and `last_error`. `deferMs` (clamped to 1 s to 1 h, at most 20 times per job,
+  then an ordinary failure) retries without using an attempt. A failed attempt backs off 15 s, 1 min, 4 min; the 4th failure sets `failed` (`maxAttempts` per job, default 4),
   and the UI offers Retry. `run_after` is a floor, not a deadline: a retry that comes due while the app sleeps runs on the next wake.
 - **Crashes.** A job whose process died stays `running` until its lease expires, then the next worker claims it again (an
   attempt is used). A job that expires on its last attempt becomes `failed` with `last_error = 'lease_expired'`, so a job
@@ -188,22 +198,26 @@ runs no timer. Set `JOBS_WORKER=off` to turn the worker (and `kick`/`nudge`) off
 - **Data.** `payload` is for ids and small parameters (4 KB cap, never personal data or secrets); `last_error` is a short
   code. The worker logs job id, kind, attempt, code and duration, never the payload, and handler errors are logged by name only
   (`JobError` codes are logged as codes). Finished rows are pruned hourly: `done` after 7 days, `failed` after 30.
-- **Shutdown.** On SIGTERM the worker stops claiming and lets running jobs finish. Anything cut off is reclaimed after its lease.
+- **Shutdown.** On SIGTERM a timer worker stops claiming; Next's standalone server exits without waiting, so in-flight jobs are
+  reclaimed after the lease. Handlers must be idempotent for that reason.
+- **Manual retry.** `retryJob` only retries the newest job for a key (`already_active` if a newer one is queued or running,
+  `not_found` for a stale one, a foreign owner, or a malformed id). Call it with `db()` rather than inside a transaction you still need:
+  in a true race it catches Postgres's unique violation and answers `already_active`, but that aborts the surrounding transaction.
 
 ### Background work per cloud
 
 The worker is a timer inside the server process, so what it can do depends on whether the platform gives that process
 CPU between requests.
 
-| Cloud | Behavior | What to do |
+| Cloud | Mode | What to do |
 | --- | --- | --- |
-| **Oracle** (long-lived container) | The process is always up, so the worker is always on. | Nothing extra. |
-| **Azure** Container Apps (scale to zero) | The replica runs only while visitors use it and for its scale-in cooldown (about 5 min) after the last request. Nothing wakes it on a schedule, and the Build Tracker parks Azure apps and doesn't ping them. | Enqueue starts the job at once (`after(kick)`), every signed-in request calls `nudge()`, and retries are sized for one visit plus the cooldown. A job saved just before the app sleeps finishes on the next visit; say so in the UI ("Finishes next time you open the app"). |
-| **Google Cloud Run** with `cpu_idle` | CPU is throttled after the response, so a background timer barely runs. | Do the work inside the request with a time budget (`await kick()` before responding), or use an external trigger. |
-| **AWS Lambda** | No CPU after the response; instances freeze. | Same: do the work inside the request, or trigger a worker from outside (for example a queue or EventBridge) that calls `kick()`. |
+| **Oracle** (long-lived container) | `timer`: the process is always up, so the worker is always on. | Enqueue, then `after(() => kick())`; `nudge()` on signed-in requests. |
+| **Azure** Container Apps (scale to zero) | `timer`: the replica runs only while visitors use it and for its scale-in cooldown (about 5 min) after the last request. Nothing wakes it on a schedule, and the Build Tracker parks Azure apps and doesn't ping them. | Same as Oracle: `after(() => kick())` starts the job at once, `nudge()` drains the rest, and retries are sized for one visit plus the cooldown. A job saved just before the app sleeps finishes on the next visit; say so in the UI ("Finishes next time you open the app"). |
+| **AWS Lambda** | `inline` (automatic): no timer, `nudge()` does nothing. Instances freeze after the response, so a timer would stall. | In the request that enqueued: `await kick({ budgetMs, ids: [id] })` before responding (default budget 15 s, under API Gateway's 29 s; each job's timeout is cut to what is left). Drain older jobs on later requests with `await kick({ budgetMs })`, again within budget. Anything left runs on a later request, or from an outside trigger (a queue or EventBridge) that calls `kick`. |
+| **Google Cloud Run** | `inline` (`JOBS_WORKER=inline`), unless CPU is always allocated (`cpu_idle` off), which costs money. With request-based CPU, a background timer barely runs. | Same as Lambda. |
 
-On the throttled clouds `await kick()` runs due jobs in the request and resolves when this process has nothing running and
-nothing due; each job is still bounded by `timeoutMs`, so size the budget to the request's limit.
+`kick({ budgetMs })` works in every mode. Inline mode claims nothing once the budget is spent, so the call returns within about
+the budget; timer mode stops claiming and waiting at the budget while running jobs carry on.
 
 ## Checks
 

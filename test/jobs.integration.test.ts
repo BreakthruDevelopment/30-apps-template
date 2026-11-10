@@ -424,6 +424,208 @@ describe.skipIf(!url)("background jobs (Postgres)", () => {
     });
   });
 
+  describe("inline mode (Lambda, Cloud Run)", () => {
+    it("picks inline from JOBS_WORKER=inline or a Lambda environment, and honours off", () => {
+      expect(w.workerMode({})).toBe("timer");
+      expect(w.workerMode({ JOBS_WORKER: "inline" })).toBe("inline");
+      expect(w.workerMode({ AWS_LAMBDA_FUNCTION_NAME: "fn" })).toBe("inline");
+      expect(w.workerMode({ AWS_LAMBDA_FUNCTION_NAME: "fn", JOBS_WORKER: "off" })).toBe("off");
+      expect(w.workerMode({ JOBS_WORKER: "garbage" })).toBe("timer");
+    });
+
+    it("runs nothing on its own: no timer start, nudge is a no-op", async () => {
+      const k = kind();
+      await q.enqueue(db, { kind: k, key: "idle" });
+      const handled = vi.fn(async () => {});
+      const worker = w.createWorker({ mode: "inline", handlers: { [k]: handled }, intervalMs: 10, nudgeMs: 0 });
+      worker.start();
+      expect(worker.nudge()).toBe(false);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(handled).not.toHaveBeenCalled();
+      await worker.kick();
+      expect(handled).toHaveBeenCalledOnce();
+    });
+
+    it("startWorker in a Lambda environment runs only inside an awaited kick", async () => {
+      const k = kind();
+      process.env.AWS_LAMBDA_FUNCTION_NAME = "fn";
+      try {
+        const { id } = await q.enqueue(db, { kind: k, key: "lam" });
+        const handled = vi.fn(async () => {});
+        w.startWorker({ handlers: { [k]: handled }, intervalMs: 10 });
+        expect(w.nudge()).toBe(false);
+        await new Promise((r) => setTimeout(r, 60));
+        expect(handled).not.toHaveBeenCalled();
+        await w.kick({ ids: [id] });
+        expect(handled).toHaveBeenCalledOnce();
+      } finally {
+        delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+      }
+    });
+
+    it("kick({ ids }) runs only those jobs", async () => {
+      const k = kind();
+      const a = await q.enqueue(db, { kind: k, key: "a" });
+      await q.enqueue(db, { kind: k, key: "b" });
+      const seen: string[] = [];
+      await w.createWorker({ mode: "inline", handlers: { [k]: async (j) => void seen.push(j.id) } }).kick({ ids: [a.id, "not-a-uuid"] });
+      expect(seen).toEqual([a.id]);
+      expect((await q.jobStatus(db, { kind: k, key: "b" }))?.state).toBe("queued");
+    });
+
+    it("stops at the budget: later jobs stay queued, a running job's timeout is cut to what is left", async () => {
+      const k = kind();
+      for (let i = 0; i < 4; i++) await q.enqueue(db, { kind: k, key: `b${i}` });
+      let aborted = 0;
+      const worker = w.createWorker({
+        mode: "inline",
+        concurrency: 1,
+        timeoutMs: 20_000,
+        leaseMs: 60_000,
+        handlers: {
+          [k]: (_j, ctx) =>
+            new Promise<void>((resolve) => {
+              const t = setTimeout(resolve, 150);
+              ctx.signal.addEventListener("abort", () => {
+                aborted++;
+                clearTimeout(t);
+                resolve();
+              });
+            }),
+        },
+      });
+      const started = Date.now();
+      await worker.kick({ budgetMs: 500 });
+      const took = Date.now() - started;
+      expect(took).toBeLessThan(1_000);
+      const states = await sql`select status, count(*)::int as n from job where kind = ${k} group by status`;
+      const done = states.find((r) => r.status === "done")?.n ?? 0;
+      expect(done).toBeGreaterThanOrEqual(2);
+      expect(done).toBeLessThan(4); // budget ran out before the queue did
+      expect(aborted).toBe(0);
+      expect((await sql`select count(*)::int as n from job where kind = ${k} and status = 'queued' and attempts = 0`)[0].n).toBeGreaterThanOrEqual(1);
+    });
+
+    it("a hung job is aborted at the budget, not at the 20 s job timeout", async () => {
+      const k = kind();
+      await q.enqueue(db, { kind: k, key: "hang" });
+      let aborted = false;
+      const worker = w.createWorker({
+        mode: "inline",
+        timeoutMs: 20_000,
+        leaseMs: 60_000,
+        handlers: {
+          [k]: (_j, ctx) => {
+            ctx.signal.addEventListener("abort", () => (aborted = true));
+            return new Promise(() => {});
+          },
+        },
+      });
+      const started = Date.now();
+      await worker.kick({ budgetMs: 600 });
+      expect(Date.now() - started).toBeLessThan(1_500);
+      expect(aborted).toBe(true);
+      expect(await q.jobStatus(db, { kind: k, key: "hang" })).toMatchObject({ state: "retrying", lastError: "timeout" });
+    });
+
+    it("timer mode also honours a budget: kick returns while a slow job carries on", async () => {
+      const k = kind();
+      await q.enqueue(db, { kind: k, key: "slowtimer" });
+      let finished = false;
+      const worker = w.createWorker({
+        handlers: { [k]: async () => { await new Promise((r) => setTimeout(r, 400)); finished = true; } },
+      });
+      const started = Date.now();
+      await worker.kick({ budgetMs: 300 });
+      expect(Date.now() - started).toBeLessThan(380);
+      expect(finished).toBe(false);
+      await worker.stop();
+      expect(finished).toBe(true);
+    });
+  });
+
+  describe("hardening", () => {
+    it("JobError only carries safe codes", () => {
+      expect(new w.JobError("host_busy").code).toBe("host_busy");
+      for (const bad of ["Could not reach ada@example.com", "", "x".repeat(41), "has space", "UPPER", "a\nb"]) {
+        const e = new w.JobError(bad);
+        expect(e.code).toBe("error");
+        expect(e.message).toBe("error");
+      }
+      expect(new w.JobError("ok", { deferMs: Number.NaN }).deferMs).toBeUndefined();
+    });
+
+    it("a handler's unsafe code never reaches the log or last_error", async () => {
+      const k = kind();
+      await q.enqueue(db, { kind: k, key: "code" });
+      process.env.LOG_LEVEL = "debug";
+      const out: string[] = [];
+      for (const m of ["log", "error"] as const) vi.spyOn(console, m).mockImplementation((line: string) => void out.push(String(line)));
+      await w.createWorker({ handlers: { [k]: async () => { throw new w.JobError("no mailbox for ada@example.com"); } } }).kick();
+      process.env.LOG_LEVEL = "error";
+      expect(out.join("\n")).not.toContain("ada@example.com");
+      expect((await q.jobStatus(db, { kind: k, key: "code" }))?.lastError).toBe("error");
+    });
+
+    it("clamps deferMs to 1 s..1 h and ignores NaN", async () => {
+      const delayed = async (opts: Parameters<Queue["fail"]>[2]) => {
+        const k = kind();
+        const { id } = await q.enqueue(db, { kind: k });
+        await q.fail(db, await claimOne(k), opts);
+        return row(id);
+      };
+      const tiny = await delayed({ code: "busy", deferMs: 0 });
+      expect(Number(tiny.in_secs)).toBeGreaterThan(0.5);
+      expect(tiny.attempts).toBe(0);
+      const huge = await delayed({ code: "busy", deferMs: 10 * 86_400_000 });
+      expect(Number(huge.in_secs)).toBeLessThanOrEqual(3_600);
+      expect(Number(huge.in_secs)).toBeGreaterThan(3_500);
+      const nan = await delayed({ code: "busy", deferMs: Number.NaN }); // an ordinary failed attempt: backoff, attempt used
+      expect(nan.attempts).toBe(1);
+      expect(Number(nan.in_secs)).toBeGreaterThan(10);
+    });
+
+    it("a deferral on the last attempt keeps the job queued; deferrals are capped and then count as failures", async () => {
+      const k = kind();
+      const { id } = await q.enqueue(db, { kind: k, key: "inf", maxAttempts: 1 });
+      for (let i = 0; i < q.MAX_DEFERRALS; i++) {
+        const j = await claimOne(k);
+        expect(j.attempts).toBe(1);
+        expect(await q.fail(db, j, { code: "host_busy", deferMs: 1_000 })).toBe("queued");
+        await due(id);
+      }
+      expect((await row(id)).deferrals).toBe(q.MAX_DEFERRALS);
+      const last = await claimOne(k);
+      expect(await q.fail(db, last, { code: "host_busy", deferMs: 1_000 })).toBe("failed"); // the only attempt is used up
+      expect(await row(id)).toMatchObject({ status: "failed", attempts: 1 });
+      expect(await q.retryJob(db, { id })).toBe("retried");
+      expect((await row(id)).deferrals).toBe(0);
+    });
+
+    it("retry by id ignores malformed ids and by key only retries the newest row", async () => {
+      const k = kind();
+      expect(await q.retryJob(db, { id: "nope" })).toBe("not_found");
+      expect(await q.retryJob(db, { id: "00000000-0000-0000-0000-000000000000" })).toBe("not_found");
+      const old = await q.enqueue(db, { kind: k, key: "n", maxAttempts: 1 });
+      await q.fail(db, await claimOne(k), { code: "error" });
+      const newer = await q.enqueue(db, { kind: k, key: "n", maxAttempts: 1 });
+      await q.complete(db, await claimOne(k)); // the newer one finished fine
+      expect(newer.id).not.toBe(old.id);
+      expect(await q.retryJob(db, { kind: k, key: "n" })).toBe("not_found"); // newest row is done
+      expect(await q.retryJob(db, { id: old.id })).toBe("not_found"); // stale failure
+      expect((await row(old.id)).status).toBe("failed");
+    });
+
+    it("payloads that can't be serialized fail validation", async () => {
+      const k = kind();
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      for (const payload of [circular, { n: BigInt(1) }, { toJSON() { throw new Error("no"); } }]) {
+        await expect(q.enqueue(db, { kind: k, payload: payload as Record<string, unknown> })).rejects.toMatchObject({ name: "ZodError" });
+      }
+    });
+  });
+
   describe("status and housekeeping", () => {
     it("reports a state for a status chip, scoped to the owner", async () => {
       const k = kind();

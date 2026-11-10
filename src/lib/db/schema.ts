@@ -147,6 +147,8 @@ export const job = pgTable(
     status: text("status", { enum: JOB_STATUSES }).notNull().default("queued"),
     attempts: integer("attempts").notNull().default(0),
     maxAttempts: integer("max_attempts").notNull().default(4),
+    /** Times a handler asked to try again later without using an attempt; capped so a job can't defer forever. */
+    deferrals: integer("deferrals").notNull().default(0),
     /** A floor, not a deadline: the job runs at the first claim after this time. */
     runAfter: timestamp("run_after", { withTimezone: true, precision: 3 }).notNull().defaultNow(),
     /** While running: the lease. After it passes, any worker may reclaim the job. */
@@ -165,7 +167,7 @@ export const job = pgTable(
     index("job_kind_key_idx").on(t.kind, t.key, t.createdAt),
     index("job_owner_idx").on(t.ownerId),
     check("job_status_chk", sql`${t.status} in (${list(JOB_STATUSES)})`),
-    check("job_attempts_chk", sql`${t.attempts} >= 0 and ${t.maxAttempts} >= 1`),
+    check("job_attempts_chk", sql`${t.attempts} >= 0 and ${t.maxAttempts} >= 1 and ${t.deferrals} >= 0`),
   ],
 );
 

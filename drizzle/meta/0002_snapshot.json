@@ -1,5 +1,5 @@
 {
-  "id": "2b7d00d3-4f15-4d9f-8f4d-f7bd31495cbe",
+  "id": "d618bdee-ac6f-45e3-9e09-5d78b842010a",
   "prevId": "5070748e-1048-4098-83f6-6a516e284c13",
   "version": "7",
   "dialect": "postgresql",
@@ -309,6 +309,13 @@
           "notNull": true,
           "default": 4
         },
+        "deferrals": {
+          "name": "deferrals",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
         "run_after": {
           "name": "run_after",
           "type": "timestamp (3) with time zone",
@@ -478,7 +485,7 @@
         },
         "job_attempts_chk": {
           "name": "job_attempts_chk",
-          "value": "\"job\".\"attempts\" >= 0 and \"job\".\"max_attempts\" >= 1"
+          "value": "\"job\".\"attempts\" >= 0 and \"job\".\"max_attempts\" >= 1 and \"job\".\"deferrals\" >= 0"
         }
       },
       "isRLSEnabled": false
