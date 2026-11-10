@@ -164,8 +164,10 @@ async function generateWithTools<T>(req: Extract<GenerateRequest<T>, { tools: un
     log.warn("ai.tool_loop.failed", { task: req.task, provider: provider.name, model: provider.model, kind, status, steps: trace.steps, calls: trace.calls });
     // A tool_loop failure is the model's behaviour, not an outage: the app shows its own fallback instead.
     if (e.AI_FALLBACK_TO_DEMO && kind !== "input_rejected" && kind !== "tool_loop") {
-      return demo().catch(() => {
-        throw err;
+      return demo().catch((demoErr) => {
+        // Running out of the shared deadline in the demo path is still a tool_loop timeout; anything
+        // else (e.g. no demo script) is less useful than the provider error that got us here.
+        throw demoErr instanceof AiError && demoErr.kind === "tool_loop" ? demoErr : err;
       });
     }
     throw err;

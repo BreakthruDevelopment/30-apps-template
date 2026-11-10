@@ -471,7 +471,7 @@ describe("generate() with tools", () => {
     // 100 ms in the live attempt + a 150 ms handler in the demo path must not fit a 200 ms budget.
     await expect(
       generate({ task: "items-assistant", system: "s", prompt: "p", schema: answer, tools: [tool], deadlineMs: 200 }),
-    ).rejects.toBeInstanceOf(Error);
+    ).rejects.toMatchObject({ kind: "tool_loop", status: "timeout" });
     expect(Date.now() - started).toBeLessThan(260);
   });
 
