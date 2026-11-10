@@ -15,6 +15,13 @@
       "when": 1794279161317,
       "tag": "0001_shared-helpers",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794280770711,
+      "tag": "0002_background-jobs",
+      "breakpoints": true
     }
   ]
 }

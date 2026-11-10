@@ -101,6 +101,7 @@ Authorization still lives in `src/lib/auth/rbac.ts` and your data functions.
 | `src/lib/magic.ts` | You accept an upload: `matchesMagic(type, bytes)` for PDF, PNG, JPEG, WebP. Never trust the Content-Type header. |
 | `src/lib/safe-fetch.ts` + `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL (needs `ip-guard.ts`): `safeFetch(url, { maxBytes, timeoutMs })`. Checking a hostname and then fetching it is not safe (DNS rebinding), so it vets the address the connection actually uses: `isPublicIp` runs inside the socket's `lookup` on every resolved address, IP literals are checked up front, redirects are followed by hand and re-checked at each hop, and the body size and total time are capped. Don't write your own fetch for user URLs; if you must, keep all of that. |
 | `src/lib/crypto/envelope.ts` | You store a secret you must read back (OAuth tokens, API keys): see [Encrypting stored secrets](#encrypting-stored-secrets). |
+| `src/lib/jobs/*` + `job` table | Work must outlive the request (fetch a page, call a model, send mail): see [Background jobs](#background-jobs). |
 | `src/lib/db/migrate-on-start.ts` | Already wired by `instrumentation.ts`. Background work that needs the schema awaits `whenMigrated()` first. |
 | `src/lib/demo-identity.ts`, `src/lib/demo-seed-config.ts` | The app has a demo workspace: `demoSeedConfig()` runs first in `scripts/seed-demo.mts` and refuses production hosts and databases; `isDemoEmail` and `MARKER` stop public sign-ups faking a demo user. Set `MARKER` per app. |
 
@@ -129,6 +130,80 @@ const token = decrypt(row.accessToken, rowAad("bank_item", row.id, row.userId));
   deploy. New writes use the new key and old rows still decrypt. Then for each row where `needsRewrap(blob)` is true, save
   `rewrap(blob)` (it re-wraps the data key without decrypting the value or needing the AAD). When none are left, remove
   `TOKEN_ENC_KEY_PREVIOUS`. Losing the key loses the data: back it up in the secret manager.
+
+## Background jobs
+
+`src/lib/jobs/` (three files plus `handlers.ts`, and the `job` table in migration `0002_background-jobs.sql`) is a small Postgres
+queue with an in-process worker. No Redis, no scheduler, no extra service. Test: `test/jobs.integration.test.ts`.
+
+```ts
+// 1. Write a handler and register it (src/lib/jobs/handlers.ts). It must be idempotent: a job can run twice.
+export const handlers: JobHandlers = {
+  "fetch-link": async (job, { signal }) => {
+    const link = await getLinkForJob(job.payload.linkId as string);   // re-read the row; skip if already done
+    if (link.status === "ready") return;
+    const page = await safeFetch(link.url, { maxBytes: 2_000_000, timeoutMs: 8_000 }); // pass `signal` to anything cancellable
+    ...
+    // throw new JobError("too_large", { permanent: true })  -> failed at once, no retries
+    // throw new JobError("host_busy", { deferMs: 5_000 })   -> try again in 5 s without using an attempt
+    // any other throw                                        -> retry with backoff
+  },
+};
+
+// 2. Enqueue inside the transaction that saves the thing (after assertCan), then start it once that commits.
+const { id, created } = await db().transaction(async (tx) => {
+  // ...insert the link...
+  return enqueue(tx, { kind: "fetch-link", key: link.id, ownerId: actor.id, payload: { linkId: link.id } });
+});
+after(() => kick()); // route handlers and server actions; runs the due jobs now
+
+// 3. On every signed-in request (requireUser / requireUserOrRedirect, or middleware): at most one claim per 10 s per process.
+nudge(); // returns false when throttled; never waits, never throws
+
+// 4. Status for a chip or poll endpoint (the payload is never returned), and manual Retry for a failed job.
+const status = await jobStatus(db(), { kind: "fetch-link", key: link.id, ownerId: actor.id });
+// status.state: queued | retrying | running | done | failed; retryInSeconds, attempts, maxAttempts, lastError (a code)
+await retryJob(db(), { kind: "fetch-link", key: link.id }, { ownerId: actor.id }); // "retried" | "not_found" | "already_active"
+after(() => kick());
+```
+
+`instrumentation.ts` starts the worker after `whenMigrated()` once `handlers` has an entry, so a template with no handlers
+runs no timer. Set `JOBS_WORKER=off` to turn the worker (and `kick`/`nudge`) off in tests and scripts.
+
+**How it behaves**
+
+- **Claiming.** One statement picks due rows with `for update skip locked`, marks them `running` and leases them for 60 s,
+  so any number of instances can share the table and a job goes to exactly one of them; no transaction stays open while
+  the handler runs. Each claim gets a fresh `lock_token`; `complete` and `fail` only apply to the current token, so a worker
+  that was too slow (its lease was reclaimed) can't overwrite the new run.
+- **Limits per process.** `concurrency` 2 jobs at once, each time-boxed to `timeoutMs` 25 s (its `signal` aborts; the timeout
+  must stay shorter than the 60 s lease, which `createWorker` enforces, so no heartbeat is needed). The worker ticks every 10 s.
+- **Retries.** A failed attempt backs off 15 s, 1 min, 4 min; the 4th failure sets `failed` (`maxAttempts` per job, default 4),
+  and the UI offers Retry. `run_after` is a floor, not a deadline: a retry that comes due while the app sleeps runs on the next wake.
+- **Crashes.** A job whose process died stays `running` until its lease expires, then the next worker claims it again (an
+  attempt is used). A job that expires on its last attempt becomes `failed` with `last_error = 'lease_expired'`, so a job
+  that keeps killing the process can't loop forever or hold its key.
+- **Idempotent enqueue.** One queued or running job per (`kind`, `key`); a second `enqueue` returns the first (`created: false`).
+  A finished job doesn't block a new one. Without a `key` nothing is deduplicated.
+- **Data.** `payload` is for ids and small parameters (4 KB cap, never personal data or secrets); `last_error` is a short
+  code. The worker logs job id, kind, attempt, code and duration, never the payload, and handler errors are logged by name only
+  (`JobError` codes are logged as codes). Finished rows are pruned hourly: `done` after 7 days, `failed` after 30.
+- **Shutdown.** On SIGTERM the worker stops claiming and lets running jobs finish. Anything cut off is reclaimed after its lease.
+
+### Background work per cloud
+
+The worker is a timer inside the server process, so what it can do depends on whether the platform gives that process
+CPU between requests.
+
+| Cloud | Behavior | What to do |
+| --- | --- | --- |
+| **Oracle** (long-lived container) | The process is always up, so the worker is always on. | Nothing extra. |
+| **Azure** Container Apps (scale to zero) | The replica runs only while visitors use it and for its scale-in cooldown (about 5 min) after the last request. Nothing wakes it on a schedule, and the Build Tracker parks Azure apps and doesn't ping them. | Enqueue starts the job at once (`after(kick)`), every signed-in request calls `nudge()`, and retries are sized for one visit plus the cooldown. A job saved just before the app sleeps finishes on the next visit; say so in the UI ("Finishes next time you open the app"). |
+| **Google Cloud Run** with `cpu_idle` | CPU is throttled after the response, so a background timer barely runs. | Do the work inside the request with a time budget (`await kick()` before responding), or use an external trigger. |
+| **AWS Lambda** | No CPU after the response; instances freeze. | Same: do the work inside the request, or trigger a worker from outside (for example a queue or EventBridge) that calls `kick()`. |
+
+On the throttled clouds `await kick()` runs due jobs in the request and resolves when this process has nothing running and
+nothing due; each job is still bounded by `timeoutMs`, so size the budget to the request's limit.
 
 ## Checks
 

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, date, index, integer, pgTable, primaryKey, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, date, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 // ---------------------------------------------------------------------------
 // Auth tables (shape required by Better Auth with the admin plugin).
@@ -129,5 +129,46 @@ export const rateEvent = pgTable(
   ],
 );
 
+export const JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
+
+/**
+ * Background job queue (see src/lib/jobs). `key` makes enqueue idempotent: only one queued or running job per
+ * (kind, key). `payload` holds ids and small parameters, never personal data or secrets. `last_error` is a short
+ * code, never a message.
+ */
+export const job = pgTable(
+  "job",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: text("kind").notNull(),
+    key: text("key"),
+    ownerId: text("owner_id").references(() => user.id, { onDelete: "cascade" }),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
+    status: text("status", { enum: JOB_STATUSES }).notNull().default("queued"),
+    attempts: integer("attempts").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(4),
+    /** A floor, not a deadline: the job runs at the first claim after this time. */
+    runAfter: timestamp("run_after", { withTimezone: true, precision: 3 }).notNull().defaultNow(),
+    /** While running: the lease. After it passes, any worker may reclaim the job. */
+    lockedUntil: timestamp("locked_until", { withTimezone: true, precision: 3 }),
+    /** Fencing token of the current claim: a worker whose lease was reclaimed can no longer complete or fail the job. */
+    lockToken: uuid("lock_token"),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at", { withTimezone: true, precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true, precision: 3 }).notNull().defaultNow(),
+    finishedAt: timestamp("finished_at", { withTimezone: true, precision: 3 }),
+  },
+  (t) => [
+    uniqueIndex("job_active_key_uidx").on(t.kind, t.key).where(sql`${t.status} in ('queued', 'running') and ${t.key} is not null`),
+    index("job_due_idx").on(t.runAfter).where(sql`${t.status} = 'queued'`),
+    index("job_lease_idx").on(t.lockedUntil).where(sql`${t.status} = 'running'`),
+    index("job_kind_key_idx").on(t.kind, t.key, t.createdAt),
+    index("job_owner_idx").on(t.ownerId),
+    check("job_status_chk", sql`${t.status} in (${list(JOB_STATUSES)})`),
+    check("job_attempts_chk", sql`${t.attempts} >= 0 and ${t.maxAttempts} >= 1`),
+  ],
+);
+
 export type User = typeof user.$inferSelect;
 export type Item = typeof item.$inferSelect;
+export type Job = typeof job.$inferSelect;
