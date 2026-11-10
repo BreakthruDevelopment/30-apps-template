@@ -100,8 +100,35 @@ Authorization still lives in `src/lib/auth/rbac.ts` and your data functions.
 | `src/lib/usage.ts` + `rate_event`, `daily_usage` tables | You cap a user's attempts (`consumeRate`, sliding window, inside `db().transaction`) or an app-wide daily budget (`reserveDaily`). List your kinds in `schema.ts` (`RATE_KINDS`, `DAILY_USAGE_KINDS`) and add a migration. Keep the transaction short and at READ COMMITTED; never hold it across an AI call (see the comments in the file). |
 | `src/lib/magic.ts` | You accept an upload: `matchesMagic(type, bytes)` for PDF, PNG, JPEG, WebP. Never trust the Content-Type header. |
 | `src/lib/safe-fetch.ts` + `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL (needs `ip-guard.ts`): `safeFetch(url, { maxBytes, timeoutMs })`. Checking a hostname and then fetching it is not safe (DNS rebinding), so it vets the address the connection actually uses: `isPublicIp` runs inside the socket's `lookup` on every resolved address, IP literals are checked up front, redirects are followed by hand and re-checked at each hop, and the body size and total time are capped. Don't write your own fetch for user URLs; if you must, keep all of that. |
+| `src/lib/crypto/envelope.ts` | You store a secret you must read back (OAuth tokens, API keys): see [Encrypting stored secrets](#encrypting-stored-secrets). |
 | `src/lib/db/migrate-on-start.ts` | Already wired by `instrumentation.ts`. Background work that needs the schema awaits `whenMigrated()` first. |
 | `src/lib/demo-identity.ts`, `src/lib/demo-seed-config.ts` | The app has a demo workspace: `demoSeedConfig()` runs first in `scripts/seed-demo.mts` and refuses production hosts and databases; `isDemoEmail` and `MARKER` stop public sign-ups faking a demo user. Set `MARKER` per app. |
+
+## Encrypting stored secrets
+
+`src/lib/crypto/envelope.ts` (one file plus its test, `node:crypto` only) encrypts a value with AES-256-GCM under a random
+per-value data key, which is wrapped by a key-encryption key (KEK) from the environment. There is no KMS (it costs money).
+The ciphertext is bound to its row through the AAD, so a blob copied to another row or user won't decrypt.
+
+```ts
+import { decrypt, encrypt, rowAad } from "@/lib/crypto/envelope";
+
+const aad = rowAad("bank_item", row.id, row.userId); // table, row id, owner: same call on write and read
+await db().update(bankItem).set({ accessToken: encrypt(token, aad) }).where(...);
+const token = decrypt(row.accessToken, rowAad("bank_item", row.id, row.userId)); // the only place that decrypts
+```
+
+- Generate a key: `openssl rand -base64 32`. Set it as `TOKEN_ENC_KEY` (cloud secret manager in production, `.env.local` locally).
+  It must decode to exactly 32 bytes. Call `validateEncryptionEnv()` at startup (for example from `instrumentation.ts`) so a
+  bad key stops the server with a clear message; it returns key ids (a hash prefix), never the key.
+- Store the blob in a `text` column. Format: `v1.<keyId>.<wrapIv>.<wrappedDek>.<wrapTag>.<iv>.<ciphertext>.<tag>`.
+- Decrypt in one function, never log what it returns, and never include the AAD or plaintext in errors. Every decrypt
+  failure throws the same `EnvelopeError`, whatever the cause.
+- Values over 64 KiB are refused (this is for small secrets such as tokens); the empty string is fine.
+- **Rotate the key:** generate a new key; set `TOKEN_ENC_KEY_PREVIOUS` to the old value and `TOKEN_ENC_KEY` to the new one;
+  deploy. New writes use the new key and old rows still decrypt. Then for each row where `needsRewrap(blob)` is true, save
+  `rewrap(blob)` (it re-wraps the data key without decrypting the value or needing the AAD). When none are left, remove
+  `TOKEN_ENC_KEY_PREVIOUS`. Losing the key loses the data: back it up in the secret manager.
 
 ## Checks
 
