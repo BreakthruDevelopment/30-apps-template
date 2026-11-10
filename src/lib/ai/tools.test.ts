@@ -475,6 +475,47 @@ describe("generate() with tools", () => {
     expect(Date.now() - started).toBeLessThan(260);
   });
 
+  it("never falls back to the demo after a propose handler ran: the error surfaces, handler ran once", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" }); // fallback on
+    const run = vi.fn(async () => ({ proposalId: "p1" }));
+    const tool = defineTool({ name: "propose_x", description: "x", args: z.object({}), kind: "propose", run });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: "propose_x", args: {} } }] } }] })),
+      )
+      .mockResolvedValue(new Response("{}", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      generate({ task: "items-assistant", system: "s", prompt: "p", schema: answer, tools: [tool] }),
+    ).rejects.toMatchObject({ kind: "provider", status: 503 });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a bad tool definition as a plain error before any model call or fallback", async () => {
+    setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const bad = defineTool({ name: "respond", description: "x", args: z.object({}), kind: "read", run: async () => null });
+    await expect(generate({ task: "items-assistant", system: "s", prompt: "p", schema: answer, tools: [bad] })).rejects.toThrow(/reserved/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("turns a throwing (async) arg schema into a tool error", async () => {
+    const run = vi.fn();
+    const tool = defineTool({
+      name: "asyncy",
+      description: "x",
+      args: z.object({ a: z.string().refine(async () => true) }),
+      kind: "read",
+      run,
+    });
+    const { provider, requests } = stub((_r, n) => (n === 1 ? turn([call("asyncy", { a: "x" })]) : turn([respond({ reply: "ok", matches: 0 })])));
+    await expect(loop(provider, [tool]).promise).resolves.toMatchObject({ reply: "ok" });
+    expect(run).not.toHaveBeenCalled();
+    expect(JSON.stringify(requests[1].history.at(-1))).toContain("tool_error");
+  });
+
   it("does not fall back to the demo when the loop itself is exhausted", async () => {
     setEnv({ AI_PROVIDER: "gemini", GEMINI_API_KEY: "k" }); // fallback defaults on
     const { tool } = items();

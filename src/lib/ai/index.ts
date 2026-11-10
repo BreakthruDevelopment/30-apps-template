@@ -10,6 +10,7 @@ import {
   MAX_MESSAGES,
   MAX_STEPS_LIMIT,
   type ToolTrace,
+  prepareTools,
   runDemoToolLoop,
   runToolLoop,
 } from "./tools";
@@ -118,6 +119,8 @@ export async function generate<T>(req: GenerateRequest<T>): Promise<GenerateResu
 
 /** The tool-use path of `generate()`: same guardrails, provider selection, demo fallback and error kinds. */
 async function generateWithTools<T>(req: Extract<GenerateRequest<T>, { tools: unknown[] }>): Promise<GenerateResult<T>> {
+  // Programmer errors (bad tool definitions) throw here: not logged as provider failures, never demo-fallback.
+  const prepared = prepareTools(req.tools, req.schema);
   const history = toolHistory(req);
   const maxSteps = req.maxSteps ?? DEFAULT_MAX_STEPS;
   const deadlineMs = req.deadlineMs ?? DEFAULT_DEADLINE_MS;
@@ -137,6 +140,7 @@ async function generateWithTools<T>(req: Extract<GenerateRequest<T>, { tools: un
     deadlineAt: Date.now() + deadlineMs,
     history,
     demoContext: req.demoContext,
+    prepared,
   };
   const e = env();
   const started = Date.now();
@@ -163,7 +167,8 @@ async function generateWithTools<T>(req: Extract<GenerateRequest<T>, { tools: un
     const status = err instanceof AiError ? err.status : undefined;
     log.warn("ai.tool_loop.failed", { task: req.task, provider: provider.name, model: provider.model, kind, status, steps: trace.steps, calls: trace.calls });
     // A tool_loop failure is the model's behaviour, not an outage: the app shows its own fallback instead.
-    if (e.AI_FALLBACK_TO_DEMO && kind !== "input_rejected" && kind !== "tool_loop") {
+    // Also never once a propose handler has started: the demo path reruns real handlers (a second proposal).
+    if (e.AI_FALLBACK_TO_DEMO && kind !== "input_rejected" && kind !== "tool_loop" && !trace.proposed) {
       return demo().catch((demoErr) => {
         // Running out of the shared deadline in the demo path is still a tool_loop timeout; anything
         // else (e.g. no demo script) is less useful than the provider error that got us here.

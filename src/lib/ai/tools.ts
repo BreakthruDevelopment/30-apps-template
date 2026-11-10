@@ -50,7 +50,12 @@ export const TOOL_SYSTEM_SUFFIX = [
 ].join("\n");
 
 /** What the loop records for the caller's log line: names, outcome codes and latency, never arguments or results. */
-export type ToolTrace = { steps: number; calls: { tool: string; outcome: string; ms: number }[] };
+export type ToolTrace = {
+  steps: number;
+  calls: { tool: string; outcome: string; ms: number }[];
+  /** A propose tool's handler has started (it may have written). Not logged; stops the demo fallback from repeating it. */
+  proposed?: boolean;
+};
 
 type Executed = { name: string; ok: boolean; data: unknown; output: Record<string, unknown>; outcome: string };
 
@@ -65,6 +70,8 @@ type LoopRequest<T> = {
   deadlineAt: number;
   history: ToolHistoryItem[];
   demoContext?: unknown;
+  /** Result of `prepareTools`; generate() prepares once, up front, so a bad definition is a programmer error. */
+  prepared?: ReturnType<typeof prepareTools>;
 };
 
 export type { LoopRequest as ToolLoopRequest };
@@ -144,9 +151,16 @@ async function executeCall(
       "(unknown)",
     );
   }
-  const parsed = tool.args.safeParse(call.args);
+  let parsed: ReturnType<typeof tool.args.safeParse>;
+  try {
+    parsed = tool.args.safeParse(call.args);
+  } catch {
+    // Tool arg schemas must be synchronous (async refinements throw here).
+    return record(failure(tool.name, "tool_error", "The tool failed."), tool.name);
+  }
   if (!parsed.success) return record(failure(tool.name, "invalid_arguments", issueSummary(parsed.error)), tool.name);
   if (signal.aborted) throw timeoutError();
+  if (tool.kind === "propose") trace.proposed = true;
 
   let result: unknown;
   try {
@@ -185,13 +199,18 @@ async function executeCall(
 }
 
 function finalAnswer<T>(schema: z.ZodType<T>, args: unknown): { ok: true; data: T } | { ok: false; issues: string } {
-  const parsed = schema.safeParse(args);
+  let parsed: ReturnType<typeof schema.safeParse>;
+  try {
+    parsed = schema.safeParse(args);
+  } catch {
+    return { ok: false, issues: "schema could not be evaluated" };
+  }
   return parsed.success ? { ok: true, data: parsed.data } : { ok: false, issues: issueSummary(parsed.error) };
 }
 
 export async function runToolLoop<T>(req: LoopRequest<T>, provider: AiProvider, trace: ToolTrace): Promise<T> {
   if (!provider.step) throw new AiError("This provider does not support tools", "input_rejected");
-  const { byName, declarations } = prepareTools(req.tools, req.schema);
+  const { byName, declarations } = req.prepared ?? prepareTools(req.tools, req.schema);
   const system = `${req.system}\n\n${TOOL_SYSTEM_SUFFIX}`;
   const deadlineAt = req.deadlineAt;
   const signal = AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()));
@@ -273,7 +292,7 @@ export async function runDemoToolLoop<T>(req: LoopRequest<T>, trace: ToolTrace):
   if (!makeScript) {
     throw new Error(`No demo tool script for AI task "${req.task}". Add one to demoToolScripts in src/lib/ai/demo.ts.`);
   }
-  const { byName } = prepareTools(req.tools, req.schema);
+  const { byName } = req.prepared ?? prepareTools(req.tools, req.schema);
   const script = makeScript(req.demoContext);
   if (script.steps.length > req.maxSteps - 1) {
     throw new Error(`Demo script for "${req.task}" has ${script.steps.length} steps; maxSteps ${req.maxSteps} leaves room for ${req.maxSteps - 1}.`);

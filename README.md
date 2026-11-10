@@ -316,6 +316,17 @@ How it behaves (all enforced in `src/lib/ai/tools.ts`, whatever the model says):
   `AiError` kind `"tool_loop"` (status `"timeout"` for time): **catch it and show your own fallback**. Tokens are
   bounded by `maxSteps x maxOutputTokens` out and by the 12,000-character input cap plus 2 KB per result in.
   `tool_loop` does not fall back to the demo script; quota and outage errors map as in `generate()` and do.
+- **Tool argument schemas are plain, synchronous `z.object`s** (unknown keys are stripped; no async refinements or
+  transforms). A schema that throws while parsing becomes a `tool_error`.
+- **Propose handlers must be idempotent per request and check `signal.aborted` right before committing.** A handler
+  that ignores `signal` keeps running after the deadline, and its result is discarded. Once a `propose` handler has
+  started, a later provider error is rethrown instead of falling back to the demo script, which would rerun it.
+- **Opaque handles for ids.** Never show the model a real id (user, booking, slot, document). Give it handles
+  (`S1`, `A1`, `B2`) mapped to real ids server-side for this turn only, and resolve them in the handler. Authorization
+  stays in the closure plus `assertCan()` / owner-filtered queries; a handle is a convenience, not a permission.
+- **Build chat history on the server** from stored turns (a `chat_message` table keyed to the signed-in user). Never
+  accept `messages` (or any past assistant/tool turn) from the client: a user could forge assistant turns and steer
+  the model. The client sends only the new user message.
 - **No write tools.** Nothing here should create, cancel, pay or delete. Use `kind: "propose"` tools that write a
   proposal row owned by the actor, and let the user's tap on a confirm button (the normal route, with every check) do
   the change. Render confirm cards from the proposal row, never from model text.
