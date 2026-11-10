@@ -43,6 +43,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/items")
 [ "$code" = "401" ] || fail "anonymous list should be 401, got $code"
 pass "anonymous access refused"
 
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" -H 'content-type: application/json' -H 'origin: https://evil.example' \
+  -d '{"title":"x"}' "$BASE_URL/api/items")
+[ "$code" = "403" ] || fail "cross-origin create should be 403, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" -H 'content-type: application/json' \
+  -d '{"title":"x"}' "$BASE_URL/api/items")
+[ "$code" = "403" ] || fail "create without an Origin should be 403, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{nope' "$BASE_URL/api/items")
+[ "$code" = "400" ] || fail "malformed JSON should be 400, got $code"
+code=$(head -c 40000 /dev/zero | tr '\0' 'x' | curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  --data-binary @- "$BASE_URL/api/items")
+[ "$code" = "413" ] || fail "oversized body should be 413, got $code"
+pass "cross-origin, malformed and oversized writes refused"
+
 item=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
   -d '{"title":"smoke item"}' "$BASE_URL/api/items") || fail "create item failed"
 id=$(echo "$item" | sed -E 's/.*"id":"([^"]+)".*/\1/')

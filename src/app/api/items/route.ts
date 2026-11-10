@@ -1,5 +1,6 @@
 import { requireUser } from "@/lib/auth/session";
-import { errorResponse } from "@/lib/http";
+import { requireSameOrigin } from "@/lib/csrf";
+import { errorResponse, readJson } from "@/lib/http";
 import { createItem, listItems } from "@/lib/items";
 
 export const dynamic = "force-dynamic";
@@ -17,8 +18,9 @@ export async function GET() {
 /** POST /api/items — body: { title: string, body?: string } */
 export async function POST(request: Request) {
   try {
+    requireSameOrigin(request); // cookie-authenticated mutation: our own Origin only
     const user = await requireUser();
-    const item = await createItem(user, await request.json().catch(() => ({})));
+    const item = await createItem(user, await readJson(request));
     return Response.json({ item }, { status: 201 });
   } catch (err) {
     return errorResponse(err);

@@ -81,6 +81,28 @@ The header links come from `NAV_LINKS` in `src/lib/app-config.ts`; each app must
 Shared button and field classes are in `src/components/ui/styles.ts` (44px minimum height). Don't add `loading.tsx` or
 `<Suspense>` above a page that calls `requireRoleOrRedirect()` or `notFound()`.
 
+## Shared helpers
+
+Small, self-contained files every app has needed. Copy the ones you use (with their tests); each imports only from
+the paths named here. Porting migration `0001_shared-helpers.sql` into an app that already has migrations: copy the SQL under the app's own
+next number, and also add its entry to `drizzle/meta/_journal.json` and its snapshot (or run `pnpm db:generate` after copying
+`schema.ts`, which writes all three); a SQL file without a journal entry is silently never applied.
+
+Authorization still lives in `src/lib/auth/rbac.ts` and your data functions.
+
+| File | Use it when |
+| --- | --- |
+| `src/lib/errors.ts` | You throw a domain error from a data function: `NotFoundError` (404), `ConflictError` (409), `BadRequestError` (400), `TooManyRequestsError` (429), `PayloadTooLargeError` (413), `UnprocessableError` (422). `errorResponse` maps them. |
+| `src/lib/http.ts` | Every route handler: `errorResponse(err)` and `readJson(request, maxBytes)` (capped read, 413 or 400 on bad bodies). `readBodyCapped` for uploads. |
+| `src/lib/safe-error.ts` | You log an error. `safeErrorFields(err)` drops database query parameters (emails, note text); never log `err.message` of a database error yourself. |
+| `src/lib/csrf.ts` | A cookie-authenticated POST, PATCH or DELETE route handler: call `requireSameOrigin(request)` first. The Origin must equal the origin of `APP_URL` exactly, so a request from any other hostname for the same app (`www.`, an alias, a bare IP) gets 403; set `APP_URL` to the one public URL. |
+| `src/lib/owned.ts` | A table is private to its owner, admin included: `ownedBy(table, actor, ...conditions)` in every select, update and delete; zero rows means 404. |
+| `src/lib/usage.ts` + `rate_event`, `daily_usage` tables | You cap a user's attempts (`consumeRate`, sliding window, inside `db().transaction`) or an app-wide daily budget (`reserveDaily`). List your kinds in `schema.ts` (`RATE_KINDS`, `DAILY_USAGE_KINDS`) and add a migration. Keep the transaction short and at READ COMMITTED; never hold it across an AI call (see the comments in the file). |
+| `src/lib/magic.ts` | You accept an upload: `matchesMagic(type, bytes)` for PDF, PNG, JPEG, WebP. Never trust the Content-Type header. |
+| `src/lib/safe-fetch.ts` + `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL (needs `ip-guard.ts`): `safeFetch(url, { maxBytes, timeoutMs })`. Checking a hostname and then fetching it is not safe (DNS rebinding), so it vets the address the connection actually uses: `isPublicIp` runs inside the socket's `lookup` on every resolved address, IP literals are checked up front, redirects are followed by hand and re-checked at each hop, and the body size and total time are capped. Don't write your own fetch for user URLs; if you must, keep all of that. |
+| `src/lib/db/migrate-on-start.ts` | Already wired by `instrumentation.ts`. Background work that needs the schema awaits `whenMigrated()` first. |
+| `src/lib/demo-identity.ts`, `src/lib/demo-seed-config.ts` | The app has a demo workspace: `demoSeedConfig()` runs first in `scripts/seed-demo.mts` and refuses production hosts and databases; `isDemoEmail` and `MARKER` stop public sign-ups faking a demo user. Set `MARKER` per app. |
+
 ## Checks
 
 ```bash
