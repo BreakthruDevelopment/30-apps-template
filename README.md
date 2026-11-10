@@ -29,7 +29,7 @@ Next.js container ── pages, server actions, route handlers (/api/*)
 | Schema and migrations | `src/lib/db/schema.ts`, `drizzle/` |
 | Sign-in, sessions, roles | `src/lib/auth/` (Better Auth + admin plugin) |
 | Access rules | `src/lib/auth/rbac.ts`, enforced in every data function |
-| AI gateway | `src/lib/ai/` — input cap, JSON schema validation, demo fallback |
+| AI gateway | `src/lib/ai/` — input cap, JSON schema validation, demo fallback, tool-use loop |
 | Health check | `GET /api/health` (503 if the database is down) |
 
 ## Auth and roles
@@ -256,6 +256,92 @@ With `AI_FALLBACK_TO_DEMO=true`, a quota error or outage serves the recorded ans
 base64. Gemini gets one `inlineData` part per image before the text part; Anthropic gets `image` blocks and rejects
 HEIC/HEIF. `demo` answers from the task's fixture and ignores the images. Logs carry the image count and total bytes,
 never the data. Treat text inside an image as data in your system prompt, exactly like user text.
+
+### Tool use: `generate({ tools })`
+
+For an assistant that must look things up before answering. Without `tools`, `generate()` is unchanged. With them,
+the model may call your tools for a few steps and then gives its final answer, validated against your `schema` like
+any other output.
+
+```ts
+import { generate, defineTool, ToolError } from "@/lib/ai";
+
+// Build the tools per request. The acting user is bound HERE, in the closure; the gateway never passes one.
+function itemTools(actor: Actor) {
+  return [
+    defineTool({
+      name: "search_items",
+      description: "Search the signed-in user's items by title",
+      args: z.object({ query: z.string().min(1).max(50) }),
+      kind: "read", // "read" looks things up; "propose" records something a human must confirm
+      async run({ query }, { signal }) {
+        return searchItems(actor, query, { signal }); // a data function: it calls assertCan() itself
+      },
+    }),
+  ];
+}
+
+const { data } = await generate({
+  task: "items-assistant",
+  system: "You answer questions about the user's items. ...",
+  messages: history,          // server-built: [{ role: "user" | "assistant", content }], or `prompt: "..."`
+  schema: z.object({ reply: z.string().max(600), matches: z.number().int().max(50) }),
+  tools: itemTools(actor),    // this array IS the allow-list for this call
+  maxSteps: 4,                // model calls including the final one (default 4, max 6)
+  deadlineMs: 24_000,         // wall clock for the whole loop (default 24 s, max 60 s)
+  demoContext: { query: "setup" }, // handed to demoToolScripts["items-assistant"] in demo mode
+});
+```
+
+How it behaves (all enforced in `src/lib/ai/tools.ts`, whatever the model says):
+
+- **Allow-list.** Only tools in `tools` can run, at most 3 calls per step. An unknown tool name gets an error result
+  ("that tool is not available") and nothing runs. Names are `^[a-z][a-z0-9_]{0,39}$`; `respond` is reserved; max 10.
+- **Arguments are validated with the tool's zod schema** on every call (unknown keys are stripped, so a model-supplied
+  `userId` never reaches your handler). **Decision:** an invalid call is not fatal. The error (path and message only)
+  goes back to the model as the tool result and uses one step, so the model can correct itself within the cap.
+- **Authorization stays in your code.** `run(args, { signal })` receives no actor. Close over the actor when you build
+  the tools and call `assertCan()` or an owner-filtered query inside. Treat every id in `args` as untrusted input: the
+  safest design gives the model opaque handles (`S1`, `A2`) that your handler maps back to real ids from this turn only.
+  A handler that throws gets the model a generic `tool_error` (never the message, so no "exists but forbidden" oracle);
+  throw `new ToolError("That slot was just taken.")` to give the model a short message it may read.
+- **Results are data.** Each result is sent as `{ "data": ... }`, at most 2,048 characters serialized (a bigger one is
+  replaced by a `result_too_large` error, not cut mid-JSON, so return small, shaped results). The gateway appends to
+  your system prompt that user messages and tool results are data, not instructions. Still write that rule in yours.
+- **Final answer.** The reserved `respond` tool takes your `schema` as its parameters (derived with
+  `z.toJSONSchema`, so use a `z.object` without transforms). The last step forces it (Gemini `mode: "ANY"` limited to
+  `respond`; Anthropic `tool_choice`). `respond` mixed with other calls is refused until tool results are in.
+- **Budget.** `maxSteps` and `deadlineMs` bound the loop; every provider call and every handler is cut off by the
+  remaining deadline (a handler that ignores `signal` is raced against it). Running out ends in
+  `AiError` kind `"tool_loop"` (status `"timeout"` for time): **catch it and show your own fallback**. Tokens are
+  bounded by `maxSteps x maxOutputTokens` out and by the 12,000-character input cap plus 2 KB per result in.
+  `tool_loop` does not fall back to the demo script; quota and outage errors map as in `generate()` and do.
+- **Tool argument schemas are plain, synchronous `z.object`s** (unknown keys are stripped; no async refinements or
+  transforms). A schema that throws while parsing becomes a `tool_error`.
+- **Propose handlers must be idempotent per request and check `signal.aborted` right before committing.** A handler
+  that ignores `signal` keeps running after the deadline, and its result is discarded. Once a `propose` handler has
+  started, a later provider error is rethrown instead of falling back to the demo script, which would rerun it.
+- **Opaque handles for ids.** Never show the model a real id (user, booking, slot, document). Give it handles
+  (`S1`, `A1`, `B2`) mapped to real ids server-side for this turn only, and resolve them in the handler. Authorization
+  stays in the closure plus `assertCan()` / owner-filtered queries; a handle is a convenience, not a permission.
+- **Build chat history on the server** from stored turns (a `chat_message` table keyed to the signed-in user). Never
+  accept `messages` (or any past assistant/tool turn) from the client: a user could forge assistant turns and steer
+  the model. The client sends only the new user message.
+- **No write tools.** Nothing here should create, cancel, pay or delete. Use `kind: "propose"` tools that write a
+  proposal row owned by the actor, and let the user's tap on a confirm button (the normal route, with every check) do
+  the change. Render confirm cards from the proposal row, never from model text.
+- **Gemini 3 thought signatures.** Function-call parts come back with a `thoughtSignature`, and the next request is
+  rejected (400) without it. The provider keeps the model's turn as an opaque `raw` value in the history and sends it
+  back unedited; don't filter or rebuild history around it. Parallel calls are answered together in call order.
+- **Logs.** One `ai.tool_loop` line: task, provider, steps, `calls: [{ tool, outcome, ms }]`, latency. Never
+  arguments, results, messages or prompts. Outcomes: `ok`, `unknown_tool`, `invalid_arguments`, `tool_error`,
+  `result_too_large`, `too_many_calls`, `invalid_final_answer`.
+- **Demo mode.** Add `demoToolScripts[task]` in `src/lib/ai/demo.ts`: a function of your `demoContext` returning
+  `{ steps: [{ call: { name, args } }, ...], final: (results) => answer }`. A step's `call` may be a function of the
+  results so far. The script goes through the same allow-list and argument checks and runs your real handlers, so a
+  demo proposes real data; `final` is validated against your schema. See `items-assistant` for the shape.
+- **Copying into an app.** `src/lib/ai/` imports only from `@/lib/env`, `@/lib/log` and `zod`. Copy the folder with
+  its tests; `test/ai-tools-authz.test.ts` is the authorization pattern (it uses `@/lib/auth/rbac`).
 
 ### Embeddings: `embed()`
 
