@@ -124,7 +124,7 @@ const token = decrypt(row.accessToken, rowAad("bank_item", row.id, row.userId));
 - Store the blob in a `text` column. Format: `v1.<keyId>.<wrapIv>.<wrappedDek>.<wrapTag>.<iv>.<ciphertext>.<tag>`.
 - Decrypt in one function, never log what it returns, and never include the AAD or plaintext in errors. Every decrypt
   failure throws the same `EnvelopeError`, whatever the cause.
-- Values over 16 MiB are refused; the empty string is fine.
+- Values over 64 KiB are refused (this is for small secrets such as tokens); the empty string is fine.
 - **Rotate the key:** generate a new key; set `TOKEN_ENC_KEY_PREVIOUS` to the old value and `TOKEN_ENC_KEY` to the new one;
   deploy. New writes use the new key and old rows still decrypt. Then for each row where `needsRewrap(blob)` is true, save
   `rewrap(blob)` (it re-wraps the data key without decrypting the value or needing the AAD). When none are left, remove

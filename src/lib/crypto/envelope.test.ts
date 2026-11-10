@@ -57,7 +57,7 @@ describe("round trip", () => {
     expect(decrypt(encrypt("", aad), aad)).toBe("");
     const bytes = randomBytes(5000);
     expect(decryptBytes(encrypt(bytes, aad), aad).equals(bytes)).toBe(true);
-    const big = "x".repeat(2 * 1024 * 1024);
+    const big = "x".repeat(MAX_PLAINTEXT_BYTES);
     expect(decrypt(encrypt(big, aad), aad)).toBe(big);
   });
 
@@ -227,6 +227,21 @@ describe("environment validation", () => {
     delete process.env[ENV_CURRENT];
     expect(() => encrypt("x", aad)).toThrow(/TOKEN_ENC_KEY is not set/);
     expect(() => rewrap(blob)).toThrow(/TOKEN_ENC_KEY is not set/);
+    expect(() => decrypt(blob, aad)).toThrow(/TOKEN_ENC_KEY is not set/);
+    expect(() => needsRewrap(blob)).toThrow(/TOKEN_ENC_KEY is not set/);
+  });
+
+  it("accepts only the canonical base64url spelling of each part", () => {
+    const blob = encrypt("canonical", aad);
+    const parts = blob.split(".");
+    const last = parts[parts.length - 1];
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    // Flipping the lowest bit of the final character only changes padding bits: same bytes, different string.
+    const flipped = last.slice(0, -1) + alphabet[alphabet.indexOf(last.slice(-1)) ^ 1];
+    expect(Buffer.from(flipped, "base64url").equals(Buffer.from(last, "base64url"))).toBe(true);
+    expect(() => decrypt([...parts.slice(0, -1), flipped].join("."), aad)).toThrow("Decryption failed");
+    expect(() => decrypt([...parts.slice(0, -1), last + "A"].join("."), aad)).toThrow("Decryption failed");
+    expect(decrypt(blob, aad)).toBe("canonical");
   });
 
   it("returns key ids, never keys", () => {

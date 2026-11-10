@@ -27,8 +27,8 @@ const KEY_BYTES = 32;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const KEY_ID_BYTES = 8;
-/** Larger values are refused up front; secrets are small and one-shot GCM holds everything in memory. */
-export const MAX_PLAINTEXT_BYTES = 16 * 1024 * 1024;
+/** Larger values are refused up front: this is for small secrets (tokens, keys), decrypted synchronously. */
+export const MAX_PLAINTEXT_BYTES = 64 * 1024;
 const MAX_BLOB_CHARS = Math.ceil((MAX_PLAINTEXT_BYTES * 4) / 3) + 1024;
 
 export const ENV_CURRENT = "TOKEN_ENC_KEY";
@@ -162,6 +162,7 @@ export function encrypt(plaintext: string | Uint8Array, aad: Aad): string {
     return serialize(current.id, wrapped, value);
   } finally {
     dek.fill(0);
+    data.fill(0); // our own copy of the plaintext
   }
 }
 
@@ -172,6 +173,7 @@ export function decrypt(blob: string, aad: Aad): string {
 
 /** Like `decrypt` but returns the raw bytes (for values that aren't text). */
 export function decryptBytes(blob: string, aad: Aad): Buffer {
+  keyring(); // a missing or invalid key is a setup error (no secrets in it), reported as such
   let dek: Buffer | undefined;
   try {
     const bound = aadBuffer(aad);
@@ -209,8 +211,9 @@ export function rewrap(blob: string): string {
 
 /** True when the blob is wrapped by a KEK other than the current one (so a rotation job should rewrap it). */
 export function needsRewrap(blob: string): boolean {
+  const currentId = keyring().current.id; // throws when the key is missing, so a rotation job can't report "nothing to do"
   try {
-    return parse(blob).kekId !== keyring().current.id;
+    return parse(blob).kekId !== currentId;
   } catch {
     return false;
   }
@@ -249,7 +252,10 @@ function parse(blob: string): Parsed {
   if (parts.length !== 8 || parts[0] !== VERSION) throw new EnvelopeError(DECRYPT_FAILED);
   const b64 = (s: string) => {
     if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new EnvelopeError(DECRYPT_FAILED);
-    return Buffer.from(s, "base64url");
+    const bytes = Buffer.from(s, "base64url");
+    // Node ignores stray trailing bits and characters; only the canonical spelling is accepted.
+    if (bytes.toString("base64url") !== s) throw new EnvelopeError(DECRYPT_FAILED);
+    return bytes;
   };
   const p: Parsed = {
     kekId: parts[1],
