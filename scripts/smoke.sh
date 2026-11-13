@@ -28,11 +28,26 @@ for path in /dashboard /admin; do
 done
 pass "signed-out dashboard and admin redirect"
 
+# Better Auth allows 3 sign-in/sign-up requests per 10 s per IP. Back-to-back runs (smoke right after seeding, or two
+# users in a row) can hit it. On a 429, wait out the window and retry once.
+post_auth() {
+  local jar=$1 path=$2 payload=$3 code
+  for attempt in 1 2; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -c "$jar" -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+      -d "$payload" "$BASE_URL$path")
+    if [ "$code" = "429" ] && [ "$attempt" = "1" ]; then
+      echo "auth rate limit (429) on $path; waiting 11s and retrying once"
+      sleep 11
+      continue
+    fi
+    break
+  done
+  case "$code" in 2??) return 0 ;; *) echo "auth request to $path returned $code" >&2; return 1 ;; esac
+}
+
 signup() {
   local jar=$1 email=$2
-  curl -fsS -c "$jar" -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \
-    -d "{\"email\":\"$email\",\"password\":\"smoke-test-password-1\",\"name\":\"Smoke\"}" \
-    "$BASE_URL/api/auth/sign-up/email" >/dev/null || fail "sign-up failed for $email"
+  post_auth "$jar" /api/auth/sign-up/email "{\"email\":\"$email\",\"password\":\"smoke-test-password-1\",\"name\":\"Smoke\"}" || fail "sign-up failed for $email"
 }
 
 signup "$JAR_A" "smoke-a-$RUN_ID@example.test"
@@ -62,6 +77,21 @@ item=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BA
 id=$(echo "$item" | sed -E 's/.*"id":"([^"]+)".*/\1/')
 [ -n "$id" ] || fail "no item id in $item"
 pass "user A created an item"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"title":"nul\u0000byte"}' "$BASE_URL/api/items")
+[ "$code" = "400" ] || fail "a NUL byte in a title should be 400, got $code"
+pass "NUL byte rejected with 400, not 500"
+
+op="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+first=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"title\":\"smoke replay\",\"clientOpId\":\"$op\"}" "$BASE_URL/api/items") || fail "idempotent create failed"
+second=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"title\":\"smoke replay\",\"clientOpId\":\"$op\"}" "$BASE_URL/api/items") || fail "idempotent replay failed"
+replay_id=$(echo "$first" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+[ "$replay_id" = "$(echo "$second" | sed -E 's/.*"id":"([^"]+)".*/\1/')" ] || fail "a replayed op id must return the first item: $first vs $second"
+curl -fsS -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/items/$replay_id" >/dev/null || fail "cleanup of the replay item failed"
+pass "replaying a client op id returns the same item"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_B" -H "origin: $BASE_URL" "$BASE_URL/api/items/$id")
 [ "$code" = "403" ] || fail "user B deleting A's item should be 403, got $code"

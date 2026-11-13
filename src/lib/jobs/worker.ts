@@ -2,7 +2,7 @@ import "server-only";
 import { db } from "@/lib/db";
 import { log } from "@/lib/log";
 import { safeErrorFields } from "@/lib/safe-error";
-import { type ClaimedJob, claim, complete, fail, failExhausted, pruneJobs } from "./queue";
+import { type ClaimedJob, claim, complete, fail, failExhaustedJobs, pruneJobs } from "./queue";
 
 const CODE = /^[a-z0-9_]{1,40}$/;
 
@@ -12,7 +12,7 @@ const CODE = /^[a-z0-9_]{1,40}$/;
  *   requests (Oracle, Azure Container Apps).
  * - `inline`: no timer and `nudge()` does nothing; jobs run only inside `await kick({ budgetMs })`, within the request. For
  *   platforms that give no CPU after the response (AWS Lambda, Cloud Run with CPU allocated only during requests).
- *   Chosen by `JOBS_WORKER=inline`, and automatically when `AWS_LAMBDA_FUNCTION_NAME` is set.
+ *   Chosen by `JOBS_WORKER=inline`, and automatically when `AWS_LAMBDA_FUNCTION_NAME` (Lambda) or `K_SERVICE` (Cloud Run) is set.
  * - `off`: nothing runs (`JOBS_WORKER=off`: tests, scripts).
  */
 export type WorkerMode = "timer" | "inline" | "off";
@@ -20,7 +20,8 @@ export type WorkerMode = "timer" | "inline" | "off";
 export function workerMode(env: Record<string, string | undefined> = process.env): WorkerMode {
   const v = env.JOBS_WORKER;
   if (v === "off" || v === "inline" || v === "timer") return v;
-  return env.AWS_LAMBDA_FUNCTION_NAME ? "inline" : "timer";
+  // Cloud Run sets K_SERVICE; with CPU allocated only during requests it behaves like Lambda.
+  return env.AWS_LAMBDA_FUNCTION_NAME || env.K_SERVICE ? "inline" : "timer";
 }
 
 /** What a handler sees. The payload is yours; never log it. */
@@ -61,8 +62,18 @@ export class JobError extends Error {
   }
 }
 
+/**
+ * Runs once when a job of that kind reaches `failed` for good: a permanent failure, attempts used up (including a
+ * deferral that ran out of deferrals), or a lease that expired on the last attempt (the process was killed). Use it
+ * to put whatever the job was working on into a state the user can act on. It must be idempotent; an error is logged
+ * and never stops the worker. `code` is the job's `last_error`.
+ */
+export type JobGiveUp = (job: JobInfo, code: string) => Promise<void>;
+
 export type WorkerOptions = {
   handlers: JobHandlers;
+  /** One optional hook per job `kind`; see `JobGiveUp`. */
+  onGiveUp?: Record<string, JobGiveUp>;
   /** Timer period; also how often exhausted leases are cleaned up. Default 10 s. */
   intervalMs?: number;
   /** Jobs running at once in this process. Default 2. */
@@ -155,8 +166,9 @@ export function createWorker(options: WorkerOptions): Worker {
   async function claimOnce(): Promise<void> {
     if (wantReap) {
       wantReap = false;
-      const n = await failExhausted(db(), kinds);
-      if (n > 0) log.warn("jobs.lease_exhausted", { count: n });
+      const exhausted = await failExhaustedJobs(db(), kinds);
+      if (exhausted.length > 0) log.warn("jobs.lease_exhausted", { count: exhausted.length });
+      for (const j of exhausted) await giveUp(j, "lease_expired");
       if (o.now() - lastPrune > 3_600_000) {
         lastPrune = o.now();
         const pruned = await pruneJobs(db());
@@ -165,6 +177,16 @@ export function createWorker(options: WorkerOptions): Worker {
     }
     if (stopped) return;
     await claimAndLaunch(() => o.timeoutMs);
+  }
+
+  async function giveUp(j: JobInfo, code: string): Promise<void> {
+    const hook = o.onGiveUp?.[j.kind];
+    if (!hook) return;
+    try {
+      await hook({ id: j.id, kind: j.kind, key: j.key, ownerId: j.ownerId, payload: j.payload }, code);
+    } catch (err) {
+      log.error("jobs.give_up_failed", { jobId: j.id, kind: j.kind, ...safeErrorFields(err) });
+    }
   }
 
   function launch(j: ClaimedJob, timeoutMs: number): Promise<void> {
@@ -254,7 +276,10 @@ export function createWorker(options: WorkerOptions): Worker {
       } else {
         const next = await fail(db(), j, failure);
         if (next === null) log.warn("jobs.lease_lost", base);
-        else log.info(next === "failed" ? "jobs.failed" : "jobs.will_retry", { ...base, code: failure.code, ms });
+        else {
+          log.info(next === "failed" ? "jobs.failed" : "jobs.will_retry", { ...base, code: failure.code, ms });
+          if (next === "failed") await giveUp(j, failure.code);
+        }
       }
     } catch (err) {
       // The lease expires and the job is reclaimed; nothing is lost.

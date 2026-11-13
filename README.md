@@ -99,7 +99,10 @@ Authorization still lives in `src/lib/auth/rbac.ts` and your data functions.
 | `src/lib/owned.ts` | A table is private to its owner, admin included: `ownedBy(table, actor, ...conditions)` in every select, update and delete; zero rows means 404. |
 | `src/lib/usage.ts` + `rate_event`, `daily_usage` tables | You cap a user's attempts (`consumeRate`, sliding window, inside `db().transaction`) or an app-wide daily budget (`reserveDaily`). List your kinds in `schema.ts` (`RATE_KINDS`, `DAILY_USAGE_KINDS`) and add a migration. Keep the transaction short and at READ COMMITTED; never hold it across an AI call (see the comments in the file). |
 | `src/lib/magic.ts` | You accept an upload: `matchesMagic(type, bytes)` for PDF, PNG, JPEG, WebP. Never trust the Content-Type header. |
-| `src/lib/safe-fetch.ts` + `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL (needs `ip-guard.ts`): `safeFetch(url, { maxBytes, timeoutMs })`. Checking a hostname and then fetching it is not safe (DNS rebinding), so it vets the address the connection actually uses: `isPublicIp` runs inside the socket's `lookup` on every resolved address, IP literals are checked up front, redirects are followed by hand and re-checked at each hop, and the body size and total time are capped. Don't write your own fetch for user URLs; if you must, keep all of that. |
+| `src/lib/safe-fetch.ts` + `src/lib/ip-guard.ts` | Your server fetches a user-supplied URL (needs `ip-guard.ts`): `safeFetch(url, { maxBytes, timeoutMs })`. Checking a hostname and then fetching it is not safe (DNS rebinding), so it vets the address the connection actually uses: `isPublicIp` runs inside the socket's `lookup` on every resolved address, IP literals are checked up front, redirects are followed by hand and re-checked at each hop, each hop resolves DNS once under the deadline and connects to that pinned address, blocked names (`localhost`, `*.local`, `*.internal`) are refused, a non-2xx status is judged before the content type (429/5xx stay retryable), the body is capped both on the wire and after decompression, one deadline (plus optional `connectTimeoutMs`/`headersTimeoutMs` and an abort `signal`) covers everything, and every failure tears down the response, decoder and request. Don't write your own fetch for user URLs; if you must, keep all of that. |
+| `src/lib/ip-limit.ts` | Public (signed-out) routes: `allowPublicRequest(clientIp(request))`, 60 per minute per IP. IPv6 is keyed by /64, the table is bounded (oldest evicted), and the file explains which `X-Forwarded-For` entry to trust on each cloud. |
+| `src/lib/text.ts` | `text(max, { min })` for free-text zod fields: trims, caps, rejects NUL bytes. `jsonHasNul` for JSON payloads. |
+| `src/lib/client-op.ts` + `src/lib/use-async-action.ts` | Client patterns: `opFor` keeps one op id per intent for idempotent retries; `useAsyncAction` / `runAsyncAction` reset a button's pending state in `finally` and show an error. The dashboard uses both. |
 | `src/lib/crypto/envelope.ts` | You store a secret you must read back (OAuth tokens, API keys): see [Encrypting stored secrets](#encrypting-stored-secrets). |
 | `src/lib/jobs/*` + `job` table | Work must outlive the request (fetch a page, call a model, send mail): see [Background jobs](#background-jobs). |
 | `src/lib/db/migrate-on-start.ts` | Already wired by `instrumentation.ts`. Background work that needs the schema awaits `whenMigrated()` first. |
@@ -170,9 +173,11 @@ await retryJob(db(), { kind: "fetch-link", key: link.id }, { ownerId: actor.id }
 after(() => kick()); // or await kick({ budgetMs }) in inline mode
 ```
 
+An optional `onGiveUp[kind]` hook in `handlers.ts` runs once when a job fails for good (permanent failure, attempts used up, or a lease that expired on the last attempt), so the app can mark whatever the job was working on as failed. `instrumentation.ts` skips `next build` (`NEXT_PHASE`) and starts the worker without awaiting it.
+
 `instrumentation.ts` starts the worker (`startJobs()` in `src/lib/jobs/start.ts`) after `whenMigrated()` once `handlers` has an
 entry, so a template with no handlers runs no timer. `JOBS_WORKER` picks the mode: `timer` (default), `inline` (also chosen
-automatically when `AWS_LAMBDA_FUNCTION_NAME` is set), or `off` for tests and scripts, which turns the worker, `kick` and `nudge` off.
+automatically when `AWS_LAMBDA_FUNCTION_NAME` or Cloud Run's `K_SERVICE` is set), or `off` for tests and scripts, which turns the worker, `kick` and `nudge` off.
 
 **Keys.** (`kind`, `key`) is unique across all users, so make `key` a globally unique value such as a row id (uuid). Never use
 something two users can share, like a URL: the second user's `enqueue` would return the first user's job (`created: false`) and

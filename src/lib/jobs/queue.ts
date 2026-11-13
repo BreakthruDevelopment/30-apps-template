@@ -2,6 +2,7 @@ import "server-only";
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { type Db, schema } from "@/lib/db";
+import { NUL_MESSAGE, hasNoNul, jsonHasNul } from "@/lib/text";
 
 /**
  * Postgres job queue. Plain functions over the `job` table; the worker (worker.ts) is the only caller of
@@ -42,12 +43,13 @@ function serializedSize(value: unknown): number {
 const enqueueSchema = z.object({
   kind: z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/),
   /** One queued or running job per (kind, key). Omit it to allow duplicates. */
-  key: z.string().min(1).max(200).optional(),
-  ownerId: z.string().min(1).max(200).optional(),
+  key: z.string().min(1).max(200).refine(hasNoNul, NUL_MESSAGE).optional(),
+  ownerId: z.string().min(1).max(200).refine(hasNoNul, NUL_MESSAGE).optional(),
   /** Ids and small parameters only: no personal data, no secrets. */
   payload: z
     .record(z.string(), z.unknown())
     .refine((p) => serializedSize(p) <= MAX_PAYLOAD_BYTES, "payload must be JSON-serializable and at most 4 KB")
+    .refine((p) => !jsonHasNul(p), NUL_MESSAGE)
     .default({}),
   delayMs: z.number().int().min(0).max(7 * 86_400_000).default(0),
   maxAttempts: z.number().int().min(1).max(10).default(DEFAULT_MAX_ATTEMPTS),
@@ -56,6 +58,9 @@ export type EnqueueInput = z.input<typeof enqueueSchema>;
 
 const ACTIVE_KEYED = sql`${job.status} in ('queued', 'running') and ${job.key} is not null`;
 const secs = (ms: number) => sql`make_interval(secs => ${ms / 1000})`;
+// `run_after` is timestamp(3), which rounds. A bare now() can land up to 0.5 ms in the future, so a delay of 0
+// is not due yet and an immediate claim misses it. Truncate so the stored instant is never after now().
+const dueAt = (ms: number) => sql`date_trunc('milliseconds', now() + ${secs(ms)})`;
 
 /**
  * Add a job unless one with the same (kind, key) is already queued or running; then return that one.
@@ -72,7 +77,7 @@ export async function enqueue(tx: Handle, input: EnqueueInput): Promise<{ id: st
         ownerId: v.ownerId ?? null,
         payload: v.payload,
         maxAttempts: v.maxAttempts,
-        runAfter: sql`now() + ${secs(v.delayMs)}`,
+        runAfter: dueAt(v.delayMs),
       })
       .onConflictDoNothing({ target: [job.kind, job.key], where: ACTIVE_KEYED })
       .returning({ id: job.id });
@@ -159,14 +164,22 @@ export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit:
  * process, or keeps timing out past the lease). Mark it failed so the UI shows Retry and its key is free.
  */
 export async function failExhausted(tx: Handle, kinds: readonly string[]): Promise<number> {
-  if (kinds.length === 0) return 0;
-  const rows = await tx.execute(sql`
+  return (await failExhaustedJobs(tx, kinds)).length;
+}
+
+/** Same as `failExhausted`, but returns the jobs it failed so the caller can tidy whatever they were working on. */
+export async function failExhaustedJobs(
+  tx: Handle,
+  kinds: readonly string[],
+): Promise<Pick<ClaimedJob, "id" | "kind" | "key" | "ownerId" | "payload">[]> {
+  if (kinds.length === 0) return [];
+  const rows = await tx.execute<{ id: string; kind: string; key: string | null; owner_id: string | null; payload: Record<string, unknown> }>(sql`
     update job set status = 'failed', last_error = 'lease_expired', locked_until = null, lock_token = null,
       finished_at = now(), updated_at = now()
     where kind in (${inList(kinds)}) and status = 'running' and locked_until < now() and attempts >= max_attempts
-    returning id
+    returning id, kind, key, owner_id, payload
   `);
-  return rows.length;
+  return rows.map((r) => ({ id: r.id, kind: r.kind, key: r.key, ownerId: r.owner_id, payload: r.payload }));
 }
 
 const holds = (j: Pick<ClaimedJob, "id" | "lockToken">) =>
@@ -214,7 +227,7 @@ export async function fail(tx: Handle, j: ClaimedJob, opts: FailOptions): Promis
       status: next,
       attempts: deferred ? Math.max(j.attempts - 1, 0) : j.attempts,
       deferrals: deferred ? sql`${job.deferrals} + 1` : sql`${job.deferrals}`,
-      runAfter: exhausted ? sql`${job.runAfter}` : sql`now() + ${secs(delay)}`,
+      runAfter: exhausted ? sql`${job.runAfter}` : dueAt(delay),
       lastError: code,
       lockedUntil: null,
       lockToken: null,
@@ -258,7 +271,7 @@ export async function retryJob(
   if (target.status !== "failed") return "not_found";
   try {
     const rows = await tx.execute(sql`
-      update job set status = 'queued', attempts = 0, deferrals = 0, run_after = now(), last_error = null, finished_at = null, updated_at = now()
+      update job set status = 'queued', attempts = 0, deferrals = 0, run_after = date_trunc('milliseconds', now()), last_error = null, finished_at = null, updated_at = now()
       where id = ${target.id} and status = 'failed'
       returning id
     `);

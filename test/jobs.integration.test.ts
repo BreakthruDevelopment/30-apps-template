@@ -544,6 +544,87 @@ describe.skipIf(!url)("background jobs (Postgres)", () => {
     });
   });
 
+  describe("give-up hook and run_after precision", () => {
+    it("a job enqueued with no delay is claimable in the same instant, every time", async () => {
+      const k = kind();
+      for (let i = 0; i < 40; i++) {
+        await q.enqueue(db, { kind: k, key: `z${i}` });
+        expect(await claimOne(k)).toBeDefined();
+      }
+    });
+
+    it("a retry and a manual retry are claimable at once (run_after is truncated, never ahead of now)", async () => {
+      const k = kind();
+      const { id } = await q.enqueue(db, { kind: k, key: "t", maxAttempts: 1 });
+      await q.fail(db, await claimOne(k), { code: "error" });
+      expect(await q.retryJob(db, { id })).toBe("retried");
+      expect(await sql`select 1 from job where id = ${id} and run_after <= now()`).toHaveLength(1);
+      expect(await claimOne(k)).toMatchObject({ id });
+    });
+
+    it("failExhaustedJobs returns what it failed, and failExhausted counts the same jobs", async () => {
+      const k = kind();
+      const { id } = await q.enqueue(db, { kind: k, key: "x", ownerId: "job-a", payload: { n: 1 }, maxAttempts: 1 });
+      await claimOne(k);
+      await sql`update job set locked_until = now() - interval '1 second' where id = ${id}`;
+      expect(await q.failExhaustedJobs(db, [k])).toEqual([{ id, kind: k, key: "x", ownerId: "job-a", payload: { n: 1 } }]);
+      expect(await q.failExhaustedJobs(db, [k])).toEqual([]);
+      expect(await q.failExhaustedJobs(db, [])).toEqual([]);
+    });
+
+    it("onGiveUp runs once for a permanent failure and once when the attempts run out, not for a retry", async () => {
+      const [perm, retry] = [kind(), kind()];
+      await q.enqueue(db, { kind: perm, key: "p", ownerId: "job-a" });
+      await q.enqueue(db, { kind: retry, key: "r" });
+      const seen: [string, string, string | null][] = [];
+      const hook = (job: { kind: string; key: string | null }, code: string) => {
+        seen.push([job.kind, code, job.key]);
+        return Promise.resolve();
+      };
+      await w
+        .createWorker({
+          handlers: {
+            [perm]: async () => {
+              throw new w.JobError("too_large", { permanent: true });
+            },
+            [retry]: async () => {
+              throw new Error("flaky");
+            },
+          },
+          onGiveUp: { [perm]: hook, [retry]: hook },
+        })
+        .kick();
+      expect(seen).toEqual([[perm, "too_large", "p"]]);
+    });
+
+    it("onGiveUp runs for a lease that expired on the last attempt, and a throwing hook never stops the worker", async () => {
+      const k = kind();
+      const { id } = await q.enqueue(db, { kind: k, key: "dead", maxAttempts: 1 });
+      await claimOne(k);
+      await sql`update job set locked_until = now() - interval '1 second' where id = ${id}`;
+      const seen: string[] = [];
+      const worker = w.createWorker({
+        handlers: { [k]: async () => {} },
+        onGiveUp: {
+          [k]: async (job, code) => {
+            seen.push(`${job.key}:${code}`);
+            throw new Error("hook blew up");
+          },
+        },
+        intervalMs: 60_000,
+        concurrency: 1,
+      });
+      worker.start();
+      try {
+        for (let i = 0; i < 100 && seen.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+      } finally {
+        await worker.stop();
+      }
+      expect(seen).toEqual(["dead:lease_expired"]);
+      expect(await row(id)).toMatchObject({ status: "failed", last_error: "lease_expired" });
+    });
+  });
+
   describe("hardening", () => {
     it("JobError only carries safe codes", () => {
       expect(new w.JobError("host_busy").code).toBe("host_busy");
