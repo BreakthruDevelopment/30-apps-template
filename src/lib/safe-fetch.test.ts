@@ -166,6 +166,18 @@ describe("safeFetch (guard against a local server)", () => {
     expect(await code(fetcher(`${base}/to-internal`, wide))).toBe("blocked");
   });
 
+  it("falls back to the next validated address when the first one is unreachable, without resolving again", async () => {
+    let resolves = 0;
+    const fallback = createSafeFetch({
+      // 127.0.0.2 refuses the connection (the test server listens on 127.0.0.1 only); both are "public" here.
+      resolve: async () => (resolves++, [{ address: "127.0.0.2", family: 4 }, { address: "127.0.0.1", family: 4 }]),
+      isPublic: (a) => a.startsWith("127.0.0."),
+    });
+    const res = await fallback(`${base}/ok`, opts());
+    expect(res.body.toString()).toBe("hello");
+    expect(resolves).toBe(1);
+  });
+
   it("pins the first answer: a later resolve that turns private is never connected to", async () => {
     let calls = 0;
     const pinned = createSafeFetch({

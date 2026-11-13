@@ -49,6 +49,7 @@ The BreakthruDevelopment org holds other, unrelated applications.
 - [ ] **Public routes have a per-IP limit** (`allowPublicRequest(clientIp(request))` in `src/lib/ip-limit.ts`); signed-in routes use the per-user limits in `usage.ts`. Read the `X-Forwarded-For` note in `ip-limit.ts` for your cloud.
 - [ ] **Structured AI output is checked on the server**: the zod schema parses the model's answer, and any ids or references in it are verified against the database before use.
 - [ ] **Smoke runs back-to-back after seeding.** Sign-ups in `scripts/smoke.sh` go through `post_auth`, which waits out Better Auth's 429 and retries once.
+- [ ] **`onGiveUp` hooks:** use only the `tx` argument, never `db()`; no slow calls (network, AI); never touch the `job` table. Writes made outside `tx` are not rolled back when the hook fails.
 - [ ] **Jobs:** register handlers (and `onGiveUp` for anything the user must see fail) in `src/lib/jobs/handlers.ts`; on Cloud Run (`K_SERVICE`) and Lambda jobs run inline inside `kick()`. Fetch user URLs only with `safeFetch`.
 
 ## Definition of done (CI enforces most of it)

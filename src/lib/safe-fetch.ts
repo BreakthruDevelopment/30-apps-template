@@ -10,8 +10,8 @@ import { isPublicIp } from "@/lib/ip-guard";
  * SSRF-safe GET for user-supplied URLs.
  *
  * Checking a hostname and then fetching it is not safe: DNS can answer differently the second time (rebinding).
- * Every address is resolved once, all of them must be public, and the socket's `lookup` returns only that pinned
- * address — it does not resolve again. TLS SNI and the Host header still use the hostname. Also:
+ * Every address is resolved once, all of them must be public, and the socket's `lookup` returns only that validated
+ * list (so connection fallback to a second address still works) — it does not resolve again. TLS SNI and the Host header still use the hostname. Also:
  * - http(s) only, ports 80/443 only (override with `allowedPorts`), no credentials in the URL;
  * - blocked names (`localhost`, `*.local`, `*.internal`, `*.azurecontainerapps.io`) and non-public IP literals
  *   are refused before any DNS or connection;
@@ -62,6 +62,7 @@ export type SafeFetchResult = { status: number; url: string; headers: Record<str
 type Resolve = (hostname: string) => Promise<{ address: string; family: number }[]>;
 export type Deps = { resolve?: Resolve; isPublic?: (address: string) => boolean };
 type Pin = { address: string; family: 4 | 6 };
+type Pins = Pin[];
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const BLOCKED_EXACT = new Set(["localhost", "local", "internal", "azurecontainerapps.io"]);
@@ -72,7 +73,7 @@ export function createSafeFetch(deps: Deps = {}) {
   const isPublic = deps.isPublic ?? isPublicIp;
   const resolve: Resolve = deps.resolve ?? ((host) => dns.promises.lookup(host, { all: true, verbatim: true }));
 
-  async function pinHost(host: string, deadline: number, signal: AbortSignal | undefined): Promise<Pin> {
+  async function pinHost(host: string, deadline: number, signal: AbortSignal | undefined): Promise<Pins> {
     let addresses: { address: string; family: number }[];
     try {
       // A resolver that never answers must not outlive the deadline or the abort signal.
@@ -84,9 +85,12 @@ export function createSafeFetch(deps: Deps = {}) {
     if (addresses.length === 0 || !addresses.every((item) => isPublic(item.address))) {
       throw new SafeFetchError("blocked");
     }
-    const first = addresses[0];
-    const family: 4 | 6 = first.family === 6 ? 6 : first.family === 4 ? 4 : first.address.includes(":") ? 6 : 4;
-    return { address: first.address, family };
+    // Keep the whole validated list from this one resolution: Node's connection fallback (an unreachable first
+    // address, such as IPv6 on a host without a route) picks from it, and nothing is ever resolved again.
+    return addresses.map((item) => ({
+      address: item.address,
+      family: item.family === 6 ? 6 : item.family === 4 ? 4 : item.address.includes(":") ? 6 : 4,
+    }));
   }
 
   function hop(
@@ -94,7 +98,7 @@ export function createSafeFetch(deps: Deps = {}) {
     headers: Record<string, string>,
     maxBytes: number,
     deadline: number,
-    pin: Pin | null,
+    pin: Pins | null,
     allowedContentTypes: string[] | undefined,
     connectTimeoutMs: number | undefined,
     headersTimeoutMs: number | undefined,
@@ -140,12 +144,11 @@ export function createSafeFetch(deps: Deps = {}) {
           callback(new SafeFetchError("blocked") as unknown as NodeJS.ErrnoException, "", 0);
           return;
         }
-        const one = { address: pin.address, family: pin.family };
         if (typeof options === "object" && options.all) {
-          (callback as unknown as (err: null, addresses: (typeof one)[]) => void)(null, [one]);
+          (callback as unknown as (err: null, addresses: Pins) => void)(null, pin);
           return;
         }
-        callback(null, pin.address, pin.family);
+        callback(null, pin[0].address, pin[0].family);
       };
 
       if (signal?.aborted) {

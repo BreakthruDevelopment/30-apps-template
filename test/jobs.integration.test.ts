@@ -694,6 +694,61 @@ describe.skipIf(!url)("background jobs (Postgres)", () => {
       expect(await q.jobStatus(db, { kind: bad, key: "1" })).toMatchObject({ state: "failed" }); // stays failed; the app reconciles
     });
 
+    const stick = async (k: string, keys: string[]) => {
+      const ids: string[] = [];
+      for (const key of keys) ids.push((await q.enqueue(db, { kind: k, key, maxAttempts: 1 })).id);
+      await q.claim(db, { kinds: [k], limit: keys.length, leaseMs: LEASE });
+      // Distinct expiry times make the reap order (oldest lease first) the order of `keys`.
+      for (const [i, id] of ids.entries()) await sql`update job set locked_until = now() - (${100 - i} * interval '1 second') where id = ${id}`;
+      return ids;
+    };
+    const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    it("a hook that writes after its cap has fired cannot commit, even while the next hook runs", async () => {
+      const k = kind();
+      const marker = await q.enqueue(db, { kind: kind(), key: "marker-late" });
+      const mark = (tx: import("@/lib/jobs/worker").JobTx, text: string) => tx.execute(dsql`update job set last_error = ${text} where id = ${marker.id}`);
+      const ids = await stick(k, ["slow", "fast"]);
+      let lateWrite: unknown = "not attempted";
+      await w
+        .createWorker({
+          hookTimeoutMs: 100,
+          handlers: { [k]: async () => {} },
+          onGiveUp: {
+            [k]: async (job, _code, tx) => {
+              if (job.key === "slow") {
+                await nap(400);
+                lateWrite = await mark(tx, "late_write").then(() => "committed-or-ran", (e: unknown) => e);
+              } else await mark(tx, "fast_ran");
+            },
+          },
+        })
+        .kick();
+      await nap(600); // let the slow hook attempt its late write
+      expect((await row(marker.id)).last_error).toBe("fast_ran");
+      expect(lateWrite).not.toBe("committed-or-ran");
+      for (const id of ids) expect((await row(id)).status).toBe("failed"); // the status change was redone without the hook
+    });
+
+    it("reaps a bounded number of stuck rows per kick, so many of them cannot overrun the budget", async () => {
+      const k = kind();
+      const ids = await stick(k, Array.from({ length: 20 }, (_, i) => `r${i}`));
+      let ran = 0;
+      const worker = w.createWorker({
+        mode: "inline",
+        handlers: { [k]: async () => {} },
+        onGiveUp: { [k]: async () => void (await nap(150), ran++) },
+      });
+      const started = Date.now();
+      await worker.kick({ budgetMs: 500 });
+      expect(Date.now() - started).toBeLessThan(1_100);
+      const failed = (await Promise.all(ids.map(row))).filter((r) => r.status === "failed").length;
+      expect(failed).toBeGreaterThanOrEqual(1);
+      expect(failed).toBeLessThanOrEqual(5);
+      expect(ran).toBeLessThanOrEqual(failed); // the last hook may be cut at the budget; its job is still failed
+      await sql`update job set status = 'failed' where kind = ${k}`;
+    });
+
     it("a stuck-row batch with a throwing hook does not stop the other jobs' hooks", async () => {
       const k = kind();
       const ids: string[] = [];

@@ -167,16 +167,27 @@ export async function failExhausted(tx: Handle, kinds: readonly string[]): Promi
   return (await failExhaustedJobs(tx, kinds)).length;
 }
 
-/** Same as `failExhausted`, but returns the jobs it failed so the caller can tidy whatever they were working on. */
+/**
+ * Same as `failExhausted`, but returns the jobs it failed so the caller can tidy whatever they were working on.
+ * `limit` caps how many are taken (the rest wait for the next call; rows another transaction holds are skipped, not
+ * waited for), and `ids` restricts it to those jobs.
+ */
 export async function failExhaustedJobs(
   tx: Handle,
   kinds: readonly string[],
+  opts: { limit?: number; ids?: readonly string[] } = {},
 ): Promise<Pick<ClaimedJob, "id" | "kind" | "key" | "ownerId" | "payload">[]> {
-  if (kinds.length === 0) return [];
+  if (kinds.length === 0 || opts.ids?.length === 0) return [];
+  const limit = opts.limit === undefined ? sql`` : sql`limit ${Math.max(1, Math.floor(opts.limit))}`;
+  const only = opts.ids ? sql`and id in (${inList(opts.ids)})` : sql``;
   const rows = await tx.execute<{ id: string; kind: string; key: string | null; owner_id: string | null; payload: Record<string, unknown> }>(sql`
     update job set status = 'failed', last_error = 'lease_expired', locked_until = null, lock_token = null,
       finished_at = now(), updated_at = now()
-    where kind in (${inList(kinds)}) and status = 'running' and locked_until < now() and attempts >= max_attempts
+    where id in (
+      select id from job
+      where kind in (${inList(kinds)}) and status = 'running' and locked_until < now() and attempts >= max_attempts ${only}
+      order by locked_until ${limit} for update skip locked
+    )
     returning id, kind, key, owner_id, payload
   `);
   return rows.map((r) => ({ id: r.id, kind: r.kind, key: r.key, ownerId: r.owner_id, payload: r.payload }));

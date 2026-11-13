@@ -62,7 +62,7 @@ export class JobError extends Error {
   }
 }
 
-/** The transaction a give-up hook runs in (a savepoint inside the one that marked the job failed). */
+/** The transaction a give-up hook runs in: the one that marks the job failed. */
 export type JobTx = Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0];
 
 /**
@@ -70,12 +70,18 @@ export type JobTx = Parameters<Parameters<ReturnType<typeof db>["transaction"]>[
  * deferral that ran out of deferrals), or a lease that expired on the last attempt (the process was killed). Use it
  * to put whatever the job was working on into a state the user can act on.
  *
- * It runs in the SAME transaction as the status change (`tx` is a savepoint inside it), so a crash between the two
- * cannot leave a failed job whose hook never ran: either both commit or neither does, and a job that was never
- * marked failed is retried or reaped again. Do your writes through `tx`. It is capped by `timeoutMs` (inline mode:
- * by what is left of the kick's budget) and `signal` aborts at that cap; pass it to anything cancellable. If the hook
- * throws or times out, its own writes are rolled back, the error is logged and the job stays `failed`, so keep the
- * hook idempotent and have the app reconcile rows it can see are stuck (for example a link still `queued` whose job
+ * It runs in the SAME transaction as the status change, so either both commit or neither does. Rules for the body:
+ * - Use only `tx`. Never `db()`: a write made outside `tx` is not rolled back when the hook fails, and it can wait
+ *   on a row `tx` holds.
+ * - Keep it short and local: a few statements on your own tables. No network or AI calls, nothing slow. It is capped
+ *   at `hookTimeoutMs` (default 5 s; inline mode: also by what is left of the kick's budget, at least 100 ms), and
+ *   `signal` aborts at that cap.
+ * - Never touch the `job` table; the worker owns it.
+ * - Make it idempotent.
+ *
+ * If the hook throws or times out, the whole transaction is rolled back (so nothing the hook did, even a late write
+ * after the cap, can commit) and the worker records the failure again WITHOUT the hook: the job ends `failed`, the
+ * error is logged, and the app must reconcile rows it can see are stuck (for example a link still `queued` whose job
  * is `failed`). Hooks never stop the worker. `code` is the job's `last_error`.
  */
 export type JobGiveUp = (job: JobInfo, code: string, tx: JobTx, signal: AbortSignal) => Promise<void>
@@ -98,6 +104,8 @@ export type WorkerOptions = {
   now?: () => number;
   /** `timer` (default) or `inline`; see `WorkerMode`. */
   mode?: "timer" | "inline";
+  /** Cap for one `onGiveUp` hook (see `JobGiveUp`). Default 5 s. */
+  hookTimeoutMs?: number;
   /** Budget `kick()` uses when you pass none. Default 15 s, well under API Gateway's 29 s. */
   budgetMs?: number;
 };
@@ -127,6 +135,9 @@ export type Worker = {
 };
 
 const MIN_BUDGET_MS = 250;
+/** Expired last-attempt jobs one reap handles; the rest wait for the next interval, so a pile-up can't overrun a kick's budget. */
+const MAX_REAP_ROWS = 5;
+class HookFailed extends Error {}
 const FIXED_MESSAGES = new Set(["database query failed", "invalid JSON or syntax", "non-error thrown"]);
 
 /**
@@ -140,7 +151,7 @@ function handlerErrorFields(err: unknown): Record<string, unknown> {
 }
 
 export function createWorker(options: WorkerOptions): Worker {
-  const o = { intervalMs: 10_000, concurrency: 2, timeoutMs: 25_000, leaseMs: 60_000, nudgeMs: 10_000, budgetMs: 15_000, mode: "timer" as const, now: Date.now, ...options };
+  const o = { intervalMs: 10_000, concurrency: 2, timeoutMs: 25_000, leaseMs: 60_000, nudgeMs: 10_000, budgetMs: 15_000, hookTimeoutMs: 5_000, mode: "timer" as const, now: Date.now, ...options };
   const inline = options.mode === "inline";
   if (!(o.concurrency >= 1)) throw new Error("concurrency must be at least 1");
   if (!(o.timeoutMs < o.leaseMs)) throw new Error("timeoutMs must be shorter than leaseMs, or a slow job's lease can expire while it runs");
@@ -175,18 +186,25 @@ export function createWorker(options: WorkerOptions): Worker {
   }
 
   /**
-   * Mark jobs whose lease expired on their last attempt as failed and run their hooks, in one transaction. They are
-   * never claimed again, so without this they stay `running` and keep their key blocked. Housekeeping (pruning old
-   * finished jobs) rides along at most once an hour.
+   * Mark jobs whose lease expired on their last attempt as failed and run their hooks. They are never claimed again,
+   * so without this they stay `running` and keep their key blocked. At most `MAX_REAP_ROWS` per call, each in its own
+   * transaction (status change plus hook), and none after `deadline`. Housekeeping (pruning old finished jobs) rides
+   * along at most once an hour.
    */
-  async function reap(hookMs: () => number): Promise<void> {
+  async function reap(hookMs: () => number, deadline = Number.POSITIVE_INFINITY): Promise<void> {
     lastReap = o.now();
-    const exhausted = await db().transaction(async (tx) => {
-      const rows = await failExhaustedJobs(tx, kinds);
-      for (const j of rows) await giveUp(tx, j, "lease_expired", hookMs());
-      return rows;
-    });
-    if (exhausted.length > 0) log.warn("jobs.lease_exhausted", { count: exhausted.length });
+    let count = 0;
+    while (count < MAX_REAP_ROWS && o.now() < deadline) {
+      const [done] = await withHook(
+        (tx) => failExhaustedJobs(tx, kinds, { limit: 1 }),
+        (rows) => (rows[0] ? { job: rows[0], code: "lease_expired" } : null),
+        (rows) => failExhaustedJobs(db(), kinds, { ids: rows.map((r) => r.id) }),
+        hookMs,
+      );
+      if (!done) break;
+      count++;
+    }
+    if (count > 0) log.warn("jobs.lease_exhausted", { count });
     if (o.now() - lastPrune > 3_600_000) {
       lastPrune = o.now();
       const pruned = await pruneJobs(db());
@@ -197,37 +215,70 @@ export function createWorker(options: WorkerOptions): Worker {
   async function claimOnce(): Promise<void> {
     if (wantReap) {
       wantReap = false;
-      await reap(() => o.timeoutMs);
+      await reap(() => o.hookTimeoutMs);
     }
     if (stopped) return;
     await claimAndLaunch(() => o.timeoutMs);
   }
 
-  /** Run the kind's hook inside a savepoint of `tx`, capped at `limitMs`. Never throws. */
-  async function giveUp(tx: JobTx, j: JobInfo, code: string, limitMs: number): Promise<void> {
-    const hook = o.onGiveUp?.[j.kind];
-    if (!hook) return;
+  /**
+   * Apply a status change and run the kind's hook in one transaction. If the hook fails or times out the whole
+   * transaction is rolled back, so a late write from a hook that outlived its cap finds a finished transaction and
+   * cannot commit; the status change is then redone in a fresh transaction without the hook.
+   */
+  async function withHook<R>(
+    apply: (tx: JobTx) => Promise<R>,
+    hookFor: (result: R) => { job: JobInfo; code: string } | null,
+    redo: (result: R) => Promise<R>,
+    hookMs: () => number,
+  ): Promise<R> {
+    let applied: { result: R; job: JobInfo; err: unknown } | null = null;
+    try {
+      return await db().transaction(async (tx) => {
+        const result = await apply(tx);
+        const h = hookFor(result);
+        const hook = h && o.onGiveUp?.[h.job.kind];
+        if (h && hook) {
+          try {
+            await runHook(hook, tx, h.job, h.code, hookMs());
+          } catch (err) {
+            applied = { result, job: h.job, err };
+            throw new HookFailed();
+          }
+        }
+        return result;
+      });
+    } catch (err) {
+      const failed = applied as { result: R; job: JobInfo; err: unknown } | null;
+      if (!(err instanceof HookFailed) || !failed) throw err;
+      log.error("jobs.give_up_failed", { jobId: failed.job.id, kind: failed.job.kind, ...handlerErrorFields(failed.err) });
+      return redo(failed.result);
+    }
+  }
+
+  async function runHook(hook: JobGiveUp, tx: JobTx, j: JobInfo, code: string, limitMs: number): Promise<void> {
     const controller = new AbortController();
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
-      await tx.transaction(async (savepoint) => {
-        const work = Promise.resolve().then(() =>
-          hook({ id: j.id, kind: j.kind, key: j.key, ownerId: j.ownerId, payload: j.payload }, code, savepoint, controller.signal),
-        );
-        work.catch(() => {}); // a hook that outlives its timeout must not become an unhandled rejection
-        const timeout = new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            controller.abort();
-            reject(new JobError("timeout"));
-          }, Math.max(1, limitMs));
-        });
-        await Promise.race([work, timeout]);
+      const work = Promise.resolve().then(() =>
+        hook({ id: j.id, kind: j.kind, key: j.key, ownerId: j.ownerId, payload: j.payload }, code, tx, controller.signal),
+      );
+      work.catch(() => {}); // a hook that outlives its timeout must not become an unhandled rejection
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort();
+          reject(new JobError("timeout"));
+        }, Math.max(1, limitMs));
       });
-    } catch (err) {
-      log.error("jobs.give_up_failed", { jobId: j.id, kind: j.kind, ...handlerErrorFields(err) });
+      await Promise.race([work, timeout]);
     } finally {
       clearTimeout(timeoutHandle);
     }
+  }
+
+  /** The cap for one hook: `hookTimeoutMs`, and in inline mode no more than what is left of the budget (at least 100 ms). */
+  function hookLimit(left?: () => number): number {
+    return inline && left ? Math.min(o.hookTimeoutMs, Math.max(left(), 100)) : o.hookTimeoutMs;
   }
 
   function launch(j: ClaimedJob, timeoutMs: number, left?: () => number): Promise<void> {
@@ -243,8 +294,8 @@ export function createWorker(options: WorkerOptions): Worker {
     const started = o.now();
     const left = () => budgetMs - (o.now() - started);
     // Inline mode has no timer to do this, so a kick does it, at most once per interval. It counts against the budget.
-    // A hook may run a little past the budget (at least 100 ms) so that a job that just ran out of attempts is not left half-done.
-    if (!stopped && o.now() - lastReap >= o.intervalMs) await reap(() => (inline ? Math.min(o.timeoutMs, Math.max(left(), 100)) : o.timeoutMs));
+    // Reaping stops at the budget; a hook may run a little past it (at least 100 ms) rather than be cut to nothing.
+    if (!stopped && o.now() - lastReap >= o.intervalMs) await reap(() => hookLimit(left), started + budgetMs);
     const mine: Promise<void>[] = [];
     while (!stopped && left() >= MIN_BUDGET_MS) {
       // Inline: a job may not outlive the request, so its timeout is what is left of the budget.
@@ -319,13 +370,12 @@ export function createWorker(options: WorkerOptions): Worker {
         else log.warn("jobs.lease_lost", base);
       } else {
         const failed = failure;
-        // The hook shares the transaction with the status change: both commit, or neither does.
-        const hookMs = inline && left ? Math.min(o.timeoutMs, Math.max(left(), 100)) : o.timeoutMs;
-        const next = await db().transaction(async (tx) => {
-          const result = await fail(tx, j, failed);
-          if (result === "failed") await giveUp(tx, j, failed.code, hookMs);
-          return result;
-        });
+        const next = await withHook(
+          (tx) => fail(tx, j, failed),
+          (result) => (result === "failed" ? { job: j, code: failed.code } : null),
+          () => fail(db(), j, failed),
+          () => hookLimit(left),
+        );
         if (next === null) log.warn("jobs.lease_lost", base);
         else log.info(next === "failed" ? "jobs.failed" : "jobs.will_retry", { ...base, code: failure.code, ms });
       }
