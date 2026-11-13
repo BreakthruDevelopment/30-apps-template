@@ -121,6 +121,9 @@ describe("safeFetch (guard against a local server)", () => {
       }
       if (url === "/hang") return;
       if (url === "/r1") return void res.writeHead(302, { location: "/r2" }).end();
+      if (url === "/hdr") return void res.writeHead(200, { "content-type": "text/plain" }).end(String(req.headers["x-secret"] ?? "none"));
+      if (url === "/to-other-host") return void res.writeHead(302, { location: `http://other.test:${(server.address() as AddressInfo).port}/hdr` }).end();
+      if (url === "/to-same-host") return void res.writeHead(302, { location: "/hdr" }).end();
       if (url === "/r2") return void res.writeHead(302, { location: "/ok" }).end();
       if (url === "/loop") return void res.writeHead(302, { location: "/loop" }).end();
       if (url === "/to-private") return void res.writeHead(302, { location: "http://10.1.2.3/secret" }).end();
@@ -240,6 +243,13 @@ describe("safeFetch (guard against a local server)", () => {
     }).catch((e: Error) => e);
     expect(String((typeErr as Error).message)).not.toContain("secret-canary");
     expect((typeErr as SafeFetchError).code).toBe("bad_content_type");
+  });
+
+  it("drops caller headers on a cross-origin redirect, and keeps them on a same-origin one", async () => {
+    const headers = { "x-secret": "token-123" };
+    expect((await fetcher(`${base}/hdr`, { ...opts(), headers })).body.toString()).toBe("token-123");
+    expect((await fetcher(`${base}/to-same-host`, { ...opts(), headers })).body.toString()).toBe("token-123");
+    expect((await fetcher(`${base}/to-other-host`, { ...opts(), headers })).body.toString()).toBe("none");
   });
 
   it("sends the default user agent unless the caller overrides it", async () => {

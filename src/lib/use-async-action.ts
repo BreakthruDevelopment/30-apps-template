@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { GENERIC_ACTION_ERROR, runAsyncAction } from "./client-op";
 
 /**
@@ -13,9 +13,15 @@ import { GENERIC_ACTION_ERROR, runAsyncAction } from "./client-op";
 export function useAsyncAction(work: () => Promise<void>, fallbackMessage: string = GENERIC_ACTION_ERROR) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const busy = useRef(false); // a ref, not state: two clicks in one tick both see the same stale `pending`
   const run = useCallback(async () => {
-    if (pending) return;
-    await runAsyncAction(work, { setPending, setError }, fallbackMessage);
-  }, [pending, work, fallbackMessage]);
+    if (busy.current) return;
+    busy.current = true;
+    try {
+      await runAsyncAction(work, { setPending, setError }, fallbackMessage);
+    } finally {
+      busy.current = false;
+    }
+  }, [work, fallbackMessage]);
   return { run, pending, error };
 }

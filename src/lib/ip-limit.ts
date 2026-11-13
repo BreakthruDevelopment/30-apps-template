@@ -45,7 +45,10 @@ export function allowPublicRequest(ip: string, now: number = Date.now(), limit: 
  * Exported for tests and for apps that want to log the key.
  */
 export function limiterKey(ip: string): string {
-  let value = ip.trim().replace(/^\[|\]$/g, "").split("%")[0];
+  let value = ip.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(value); // [2001:db8::1] or [2001:db8::1]:443
+  if (bracketed) value = bracketed[1];
+  value = value.split("%")[0];
   const withPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(value); // some proxies append the source port to IPv4
   if (withPort) value = withPort[1];
   const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
@@ -84,9 +87,11 @@ function expandV6(address: string): string[] | null {
  *   - Azure Container Apps (Envoy ingress): appends the connecting client IP last. OK.
  *   - Google Cloud Run served directly: appends the connecting client IP last. OK. Behind a Google external load
  *     balancer the header ends `client, load-balancer`, so the last entry is the balancer's: take the second to last.
- *   - Oracle (OCI load balancer) and any other proxy: appends the client IP last; confirm once with a curl that sends
- *     a fake `X-Forwarded-For`, and check that the fake value is NOT the one returned.
- * With no header (local dev, direct hit) the result is "unknown", which all share one bucket. If a second proxy is ever
+ *   - Oracle (Caddy on the VM) and any other reverse proxy: Caddy's `reverse_proxy` replaces a client-supplied header
+ *     with the connecting address unless `trusted_proxies` is set, so the last entry is right. Confirm once with a curl
+ *     that sends a fake `X-Forwarded-For`, and check that the fake value is NOT the one returned.
+ * When a request arrives with no header (local dev, a direct hit), Next fills `X-Forwarded-For` from the socket, so you
+ * get the connecting address. "unknown" only happens where no server sets it (unit tests, odd runtimes) and all of those share one bucket. If a second proxy is ever
  * added in front of the app, revisit this function; otherwise every visitor will share the proxy's address.
  */
 export function clientIp(request: Request): string {

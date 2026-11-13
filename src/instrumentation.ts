@@ -3,8 +3,9 @@
  * pending database migrations before the server takes traffic. A Postgres advisory
  * lock makes it safe when several instances start at once.
  *
- * The job worker starts after that, on the timer (Azure Container Apps keeps CPU
- * between requests). `next build` sets NEXT_PHASE and must not open a database pool.
+ * The job worker starts after that. In timer mode (servers that keep their CPU) it polls; in inline mode (Lambda,
+ * Cloud Run) it starts nothing and jobs run inside `kick()`. `next build` sets NEXT_PHASE and must not open a
+ * database pool.
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;

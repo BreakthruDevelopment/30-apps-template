@@ -241,6 +241,7 @@ export function createSafeFetch(deps: Deps = {}) {
     const deadline = Date.now() + (opts.timeoutMs ?? 10_000);
     if (opts.signal?.aborted) throw new SafeFetchError("timeout");
 
+    let headers = opts.headers ?? {};
     let url = parse(input);
     for (let redirects = 0; ; redirects++) {
       if (opts.signal?.aborted) throw new SafeFetchError("timeout");
@@ -249,7 +250,7 @@ export function createSafeFetch(deps: Deps = {}) {
       const pin = isIP(host) ? null : await pinHost(host, deadline, opts.signal);
       const res = await hop(
         url,
-        opts.headers ?? {},
+        headers,
         maxBytes,
         deadline,
         pin,
@@ -261,7 +262,10 @@ export function createSafeFetch(deps: Deps = {}) {
       const location = res.headers.location;
       if (!REDIRECTS.has(res.status) || !location) return { ...res, url: url.toString() };
       if (redirects >= maxRedirects) throw new SafeFetchError("too_many_redirects");
-      url = parse(location, url);
+      const next = parse(location, url);
+      // Caller headers (tokens, cookies, API keys) were meant for the first host: never forward them to another origin.
+      if (next.origin !== url.origin) headers = {};
+      url = next;
     }
   };
 }

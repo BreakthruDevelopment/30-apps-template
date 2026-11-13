@@ -33,6 +33,8 @@ describe("public per-IP limiter", () => {
     expect(limiterKey("[2001:db8::1]")).toBe("2001:db8:0:0::/64");
     expect(limiterKey("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
     expect(limiterKey("1.2.3.4:5555")).toBe("1.2.3.4");
+    expect(limiterKey("[2001:db8::1]:443")).toBe("2001:db8:0:0::/64");
+    expect(limiterKey("[::ffff:1.2.3.4]:80")).toBe("1.2.3.4");
     expect(limiterKey("64:ff9b::1.2.3.4")).toBe("64:ff9b:0:0::/64");
     expect(limiterKey("unknown")).toBe("unknown");
     expect(limiterKey("not-an-ip")).toBe("unknown");

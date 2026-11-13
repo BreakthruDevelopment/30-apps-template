@@ -1,4 +1,5 @@
 /** Background job queue against Postgres: idempotent enqueue, exclusive claims, leases, backoff, retry, worker behaviour. */
+import { sql as dsql } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -622,6 +623,101 @@ describe.skipIf(!url)("background jobs (Postgres)", () => {
       }
       expect(seen).toEqual(["dead:lease_expired"]);
       expect(await row(id)).toMatchObject({ status: "failed", last_error: "lease_expired" });
+    });
+  });
+
+  describe("give-up hook in inline mode and in the status transaction", () => {
+    const failPermanently = async () => {
+      throw new w.JobError("too_large", { permanent: true });
+    };
+
+    it("an inline kick reaps a lease that expired on the last attempt, runs its hook and frees the key", async () => {
+      const k = kind();
+      const { id } = await q.enqueue(db, { kind: k, key: "stuck", maxAttempts: 1 });
+      await claimOne(k);
+      await sql`update job set locked_until = now() - interval '1 second' where id = ${id}`;
+      const seen: string[] = [];
+      const worker = w.createWorker({
+        mode: "inline",
+        handlers: { [k]: async () => {} },
+        onGiveUp: { [k]: async (job, code) => void seen.push(`${job.key}:${code}`) },
+      });
+      await worker.kick({ budgetMs: 2_000 });
+      expect(seen).toEqual(["stuck:lease_expired"]);
+      expect(await row(id)).toMatchObject({ status: "failed", last_error: "lease_expired" });
+      expect((await q.enqueue(db, { kind: k, key: "stuck" })).created).toBe(true);
+      await worker.kick({ budgetMs: 2_000 }); // throttled by intervalMs: not reaped twice
+      expect(seen).toHaveLength(1);
+    });
+
+    it("a hook that hangs is cut off at the kick's budget and told to abort", async () => {
+      const k = kind();
+      await q.enqueue(db, { kind: k, key: "slow-hook" });
+      let aborted = false;
+      const worker = w.createWorker({
+        mode: "inline",
+        handlers: { [k]: failPermanently },
+        onGiveUp: {
+          [k]: (_job, _code, _tx, signal) =>
+            new Promise<void>(() => {
+              signal.addEventListener("abort", () => (aborted = true));
+            }),
+        },
+      });
+      const started = Date.now();
+      await worker.kick({ budgetMs: 500 });
+      expect(Date.now() - started).toBeLessThan(1_500);
+      expect(aborted).toBe(true);
+      expect(await q.jobStatus(db, { kind: k, key: "slow-hook" })).toMatchObject({ state: "failed", lastError: "too_large" });
+    });
+
+    it("the hook's writes commit with the status change, and roll back when the hook throws", async () => {
+      const [ok, bad] = [kind(), kind()];
+      const marker = await q.enqueue(db, { kind: kind(), key: "marker" });
+      await q.enqueue(db, { kind: ok, key: "1" });
+      await q.enqueue(db, { kind: bad, key: "1" });
+      const mark = (tx: import("@/lib/jobs/worker").JobTx, text: string) => tx.execute(dsql`update job set last_error = ${text} where id = ${marker.id}`);
+      await w
+        .createWorker({
+          handlers: { [ok]: failPermanently, [bad]: failPermanently },
+          onGiveUp: {
+            [ok]: async (_j, _c, tx) => void (await mark(tx, "hook_ran")),
+            [bad]: async (_j, _c, tx) => {
+              await mark(tx, "must_roll_back");
+              throw new Error("hook failed");
+            },
+          },
+        })
+        .kick();
+      expect((await row(marker.id)).last_error).toBe("hook_ran");
+      expect(await q.jobStatus(db, { kind: ok, key: "1" })).toMatchObject({ state: "failed" });
+      expect(await q.jobStatus(db, { kind: bad, key: "1" })).toMatchObject({ state: "failed" }); // stays failed; the app reconciles
+    });
+
+    it("a stuck-row batch with a throwing hook does not stop the other jobs' hooks", async () => {
+      const k = kind();
+      const ids: string[] = [];
+      for (const key of ["a", "b"]) {
+        const { id } = await q.enqueue(db, { kind: k, key, maxAttempts: 1 });
+        ids.push(id);
+      }
+      await q.claim(db, { kinds: [k], limit: 5, leaseMs: LEASE });
+      await sql`update job set locked_until = now() - interval '1 second' where kind = ${k}`;
+      const seen: string[] = [];
+      await w
+        .createWorker({
+          mode: "inline",
+          handlers: { [k]: async () => {} },
+          onGiveUp: {
+            [k]: async (job) => {
+              seen.push(String(job.key));
+              if (job.key === "a") throw new Error("boom");
+            },
+          },
+        })
+        .kick({ budgetMs: 1_000 });
+      expect(seen.sort()).toEqual(["a", "b"]);
+      for (const id of ids) expect((await row(id)).status).toBe("failed");
     });
   });
 

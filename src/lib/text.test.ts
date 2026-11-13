@@ -23,7 +23,8 @@ describe("text()", () => {
     expect(jsonHasNul({ a: ["x", { b: "ok" }] })).toBe(false);
     expect(jsonHasNul({ a: ["x", { b: "bad\0" }] })).toBe(true);
     expect(jsonHasNul({ "k\0": 1 })).toBe(true);
-    expect(jsonHasNul("literal \\u0000 text is not a NUL, but is conservatively refused")).toBe(true);
+    expect(jsonHasNul("C:\\u0000dir")).toBe(false); // literal backslash-u text is fine
+    expect(jsonHasNul({ path: "C:\\u0000dir" })).toBe(false);
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     expect(jsonHasNul(cyclic)).toBe(true);
