@@ -82,9 +82,11 @@ export const item = pgTable(
       .references(() => user.id, { onDelete: "cascade" }),
     title: text("title").notNull(),
     body: text("body").notNull().default(""),
+    /** Set by clients that retry (see src/lib/client-op.ts); unique per owner, so a replay returns the first row. */
+    clientOpId: uuid("client_op_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("item_owner_id_idx").on(t.ownerId)],
+  (t) => [index("item_owner_id_idx").on(t.ownerId), uniqueIndex("item_owner_client_op_uidx").on(t.ownerId, t.clientOpId)],
 );
 
 // ---------------------------------------------------------------------------

@@ -1,16 +1,28 @@
 "use client";
 
-import { useActionState, useRef, useState, useTransition } from "react";
+import { useActionState, useRef, useState } from "react";
 import { DemoBadge } from "@/components/ui";
 import { buttonPrimary, buttonSecondary, inputClass } from "@/components/ui/styles";
+import { type KeyedOp, opFor } from "@/lib/client-op";
+import { useAsyncAction } from "@/lib/use-async-action";
 import { type ActionState, type SummaryState, addItemAction, summarizeAction } from "./actions";
 
 export function AddItemForm() {
   const formRef = useRef<HTMLFormElement>(null);
+  // One op id per intent: a retry after a lost response reuses it, so the server returns the first item instead of
+  // creating a second. Cleared once the server has answered; kept when the call throws (see src/lib/client-op.ts).
+  const op = useRef<KeyedOp | null>(null);
   const [state, action, pending] = useActionState<ActionState, FormData>(async (prev, form) => {
-    const result = await addItemAction(prev, form);
-    if (result.ok) formRef.current?.reset();
-    return result;
+    op.current = opFor(op.current, [form.get("title"), form.get("body")]);
+    form.set("clientOpId", op.current.id);
+    try {
+      const result = await addItemAction(prev, form);
+      op.current = null;
+      if (result.ok) formRef.current?.reset();
+      return result;
+    } catch {
+      return { error: "Couldn't reach the server. Try again." };
+    }
   }, {});
 
   return (
@@ -38,7 +50,11 @@ export function AddItemForm() {
 /** The AI result area: idle, pending, error and answer states, with the demo label when the answer is recorded. */
 export function SummaryPanel() {
   const [state, setState] = useState<SummaryState | null>(null);
-  const [pending, startTransition] = useTransition();
+  // `pending` resets in a finally even if the action throws, and a throw becomes `error` below.
+  const { run, pending, error: thrown } = useAsyncAction(async () => {
+    setState(await summarizeAction());
+  }, "Couldn't summarize right now. Try again.");
+  const error = thrown ?? state?.error;
 
   return (
     <div className="space-y-3">
@@ -46,7 +62,7 @@ export function SummaryPanel() {
         <button
           type="button"
           disabled={pending}
-          onClick={() => startTransition(async () => setState(await summarizeAction()))}
+          onClick={run}
           className={buttonSecondary}
         >
           {pending ? "Summarizing…" : "Summarize my items"}
@@ -55,12 +71,12 @@ export function SummaryPanel() {
       </div>
       <div aria-live="polite">
         {pending && <p className="text-sm text-muted">Working on it…</p>}
-        {!pending && state?.error && (
+        {!pending && error && (
           <p role="alert" className="text-sm font-medium text-danger">
-            {state.error}
+            {error}
           </p>
         )}
-        {!pending && state?.summary && (
+        {!pending && !error && state?.summary && (
           <div className="space-y-2">
             <p>{state.summary}</p>
             {state.highlights && state.highlights.length > 0 && (
@@ -72,7 +88,7 @@ export function SummaryPanel() {
             )}
           </div>
         )}
-        {!pending && !state && (
+        {!pending && !state && !error && (
           <p className="text-sm text-muted">Generates a short summary of your items with the app&apos;s model.</p>
         )}
       </div>

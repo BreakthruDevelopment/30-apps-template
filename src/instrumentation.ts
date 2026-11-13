@@ -1,11 +1,15 @@
 /**
  * Runs once when a server instance starts. With MIGRATE_ON_START=true it applies
  * pending database migrations before the server takes traffic. A Postgres advisory
- * lock makes it safe when several instances start at once. Then it starts the background
- * job worker (a no-op until an app registers handlers in src/lib/jobs/handlers.ts).
+ * lock makes it safe when several instances start at once.
+ *
+ * The job worker starts after that. In timer mode (servers that keep their CPU) it polls; in inline mode (Lambda,
+ * Cloud Run) it starts nothing and jobs run inside `kick()`. `next build` sets NEXT_PHASE and must not open a
+ * database pool.
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+  if (process.env.NEXT_PHASE === "phase-production-build") return;
   if (process.env.MIGRATE_ON_START === "true") {
     const { migrateOnStart } = await import("./lib/db/migrate-on-start");
     await migrateOnStart();

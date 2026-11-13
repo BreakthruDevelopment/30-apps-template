@@ -13,7 +13,7 @@ export type ActionState = { error?: string; ok?: boolean };
 export async function addItemAction(_prev: ActionState, form: FormData): Promise<ActionState> {
   try {
     const user = await requireUser();
-    await createItem(user, { title: form.get("title"), body: form.get("body") ?? "" });
+    await createItem(user, { title: form.get("title"), body: form.get("body") ?? "", clientOpId: form.get("clientOpId") ?? undefined });
     revalidatePath("/dashboard");
     return { ok: true };
   } catch (err) {

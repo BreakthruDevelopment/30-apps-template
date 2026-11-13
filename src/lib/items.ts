@@ -1,9 +1,10 @@
 import "server-only";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { generate } from "@/lib/ai";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { db, schema } from "@/lib/db";
+import { text } from "@/lib/text";
 
 /**
  * Example domain module. Every function takes the acting user and checks
@@ -11,8 +12,10 @@ import { db, schema } from "@/lib/db";
  */
 
 export const newItemInput = z.object({
-  title: z.string().trim().min(1, "Title is required").max(200),
-  body: z.string().trim().max(5000).default(""),
+  title: text(200, { min: 1, minMessage: "Title is required" }),
+  body: text(5000).default(""),
+  /** Client-generated id for one user intent (see `src/lib/client-op.ts`). Retrying with the same id never creates a second row. */
+  clientOpId: z.string().uuid().optional(),
 });
 
 export async function listItems(actor: Actor) {
@@ -27,8 +30,15 @@ export async function createItem(actor: Actor, input: unknown) {
   const [row] = await db()
     .insert(schema.item)
     .values({ ...data, ownerId: actor.id })
+    .onConflictDoNothing({ target: [schema.item.ownerId, schema.item.clientOpId] })
     .returning();
-  return row;
+  if (row) return row;
+  // The same op id came in before (a retry after a lost response): return the row it created, scoped to this user.
+  const [existing] = await db()
+    .select()
+    .from(schema.item)
+    .where(and(eq(schema.item.ownerId, actor.id), eq(schema.item.clientOpId, data.clientOpId!)));
+  return existing;
 }
 
 export async function deleteItem(actor: Actor, id: string) {

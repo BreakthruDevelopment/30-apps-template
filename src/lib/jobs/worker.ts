@@ -2,7 +2,7 @@ import "server-only";
 import { db } from "@/lib/db";
 import { log } from "@/lib/log";
 import { safeErrorFields } from "@/lib/safe-error";
-import { type ClaimedJob, claim, complete, fail, failExhausted, pruneJobs } from "./queue";
+import { type ClaimedJob, claim, complete, fail, failExhaustedJobs, pruneJobs } from "./queue";
 
 const CODE = /^[a-z0-9_]{1,40}$/;
 
@@ -12,7 +12,7 @@ const CODE = /^[a-z0-9_]{1,40}$/;
  *   requests (Oracle, Azure Container Apps).
  * - `inline`: no timer and `nudge()` does nothing; jobs run only inside `await kick({ budgetMs })`, within the request. For
  *   platforms that give no CPU after the response (AWS Lambda, Cloud Run with CPU allocated only during requests).
- *   Chosen by `JOBS_WORKER=inline`, and automatically when `AWS_LAMBDA_FUNCTION_NAME` is set.
+ *   Chosen by `JOBS_WORKER=inline`, and automatically when `AWS_LAMBDA_FUNCTION_NAME` (Lambda) or `K_SERVICE` (Cloud Run) is set.
  * - `off`: nothing runs (`JOBS_WORKER=off`: tests, scripts).
  */
 export type WorkerMode = "timer" | "inline" | "off";
@@ -20,7 +20,8 @@ export type WorkerMode = "timer" | "inline" | "off";
 export function workerMode(env: Record<string, string | undefined> = process.env): WorkerMode {
   const v = env.JOBS_WORKER;
   if (v === "off" || v === "inline" || v === "timer") return v;
-  return env.AWS_LAMBDA_FUNCTION_NAME ? "inline" : "timer";
+  // Cloud Run sets K_SERVICE; with CPU allocated only during requests it behaves like Lambda.
+  return env.AWS_LAMBDA_FUNCTION_NAME || env.K_SERVICE ? "inline" : "timer";
 }
 
 /** What a handler sees. The payload is yours; never log it. */
@@ -61,8 +62,34 @@ export class JobError extends Error {
   }
 }
 
+/** The transaction a give-up hook runs in: the one that marks the job failed. */
+export type JobTx = Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0];
+
+/**
+ * Called when a job of that kind reaches `failed` for good: a permanent failure, attempts used up (including a
+ * deferral that ran out of deferrals), or a lease that expired on the last attempt (the process was killed). Use it
+ * to put whatever the job was working on into a state the user can act on.
+ *
+ * It runs in the SAME transaction as the status change, so either both commit or neither does. Rules for the body:
+ * - Use only `tx`. Never `db()`: a write made outside `tx` is not rolled back when the hook fails, and it can wait
+ *   on a row `tx` holds.
+ * - Keep it short and local: a few statements on your own tables. No network or AI calls, nothing slow. It is capped
+ *   at `hookTimeoutMs` (default 5 s; inline mode: also by what is left of the kick's budget, at least 100 ms), and
+ *   `signal` aborts at that cap.
+ * - Never touch the `job` table; the worker owns it.
+ * - Make it idempotent.
+ *
+ * If the hook throws or times out, the whole transaction is rolled back (so nothing the hook did, even a late write
+ * after the cap, can commit) and the worker records the failure again WITHOUT the hook: the job ends `failed`, the
+ * error is logged, and the app must reconcile rows it can see are stuck (for example a link still `queued` whose job
+ * is `failed`). Hooks never stop the worker. `code` is the job's `last_error`.
+ */
+export type JobGiveUp = (job: JobInfo, code: string, tx: JobTx, signal: AbortSignal) => Promise<void>
+
 export type WorkerOptions = {
   handlers: JobHandlers;
+  /** One optional hook per job `kind`; see `JobGiveUp`. */
+  onGiveUp?: Record<string, JobGiveUp>;
   /** Timer period; also how often exhausted leases are cleaned up. Default 10 s. */
   intervalMs?: number;
   /** Jobs running at once in this process. Default 2. */
@@ -77,6 +104,8 @@ export type WorkerOptions = {
   now?: () => number;
   /** `timer` (default) or `inline`; see `WorkerMode`. */
   mode?: "timer" | "inline";
+  /** Cap for one `onGiveUp` hook (see `JobGiveUp`). Default 5 s. */
+  hookTimeoutMs?: number;
   /** Budget `kick()` uses when you pass none. Default 15 s, well under API Gateway's 29 s. */
   budgetMs?: number;
 };
@@ -106,6 +135,9 @@ export type Worker = {
 };
 
 const MIN_BUDGET_MS = 250;
+/** Expired last-attempt jobs one reap handles; the rest wait for the next interval, so a pile-up can't overrun a kick's budget. */
+const MAX_REAP_ROWS = 5;
+class HookFailed extends Error {}
 const FIXED_MESSAGES = new Set(["database query failed", "invalid JSON or syntax", "non-error thrown"]);
 
 /**
@@ -119,7 +151,7 @@ function handlerErrorFields(err: unknown): Record<string, unknown> {
 }
 
 export function createWorker(options: WorkerOptions): Worker {
-  const o = { intervalMs: 10_000, concurrency: 2, timeoutMs: 25_000, leaseMs: 60_000, nudgeMs: 10_000, budgetMs: 15_000, mode: "timer" as const, now: Date.now, ...options };
+  const o = { intervalMs: 10_000, concurrency: 2, timeoutMs: 25_000, leaseMs: 60_000, nudgeMs: 10_000, budgetMs: 15_000, hookTimeoutMs: 5_000, mode: "timer" as const, now: Date.now, ...options };
   const inline = options.mode === "inline";
   if (!(o.concurrency >= 1)) throw new Error("concurrency must be at least 1");
   if (!(o.timeoutMs < o.leaseMs)) throw new Error("timeoutMs must be shorter than leaseMs, or a slow job's lease can expire while it runs");
@@ -134,41 +166,123 @@ export function createWorker(options: WorkerOptions): Worker {
   let timer: ReturnType<typeof setInterval> | undefined;
   let lastNudge = Number.NEGATIVE_INFINITY;
   let lastPrune = 0;
+  let lastReap = Number.NEGATIVE_INFINITY;
 
   /**
    * Claim up to the free slots and launch the jobs. Slots are reserved while the claim is in flight, so two callers
    * (the timer and a kick) can't both fill the same free slots and exceed `concurrency`.
    * Returns null when no slot was free, else the launched jobs.
    */
-  async function claimAndLaunch(timeoutFor: () => number, ids?: readonly string[]): Promise<Promise<void>[] | null> {
+  async function claimAndLaunch(timeoutFor: () => number, ids?: readonly string[], left?: () => number): Promise<Promise<void>[] | null> {
     const free = o.concurrency - running.size - reserved;
     if (free < 1) return null;
     reserved += free;
     try {
       const claimed = await claim(db(), { kinds, limit: free, leaseMs: o.leaseMs, ids });
-      return claimed.map((j) => launch(j, timeoutFor()));
+      return claimed.map((j) => launch(j, timeoutFor(), left));
     } finally {
       reserved -= free;
+    }
+  }
+
+  /**
+   * Mark jobs whose lease expired on their last attempt as failed and run their hooks. They are never claimed again,
+   * so without this they stay `running` and keep their key blocked. At most `MAX_REAP_ROWS` per call, each in its own
+   * transaction (status change plus hook), and none after `deadline`. Housekeeping (pruning old finished jobs) rides
+   * along at most once an hour.
+   */
+  async function reap(hookMs: () => number, deadline = Number.POSITIVE_INFINITY): Promise<void> {
+    lastReap = o.now();
+    let count = 0;
+    while (count < MAX_REAP_ROWS && o.now() < deadline) {
+      const [done] = await withHook(
+        (tx) => failExhaustedJobs(tx, kinds, { limit: 1 }),
+        (rows) => (rows[0] ? { job: rows[0], code: "lease_expired" } : null),
+        (rows) => failExhaustedJobs(db(), kinds, { ids: rows.map((r) => r.id) }),
+        hookMs,
+      );
+      if (!done) break;
+      count++;
+    }
+    if (count > 0) log.warn("jobs.lease_exhausted", { count });
+    if (o.now() - lastPrune > 3_600_000) {
+      lastPrune = o.now();
+      const pruned = await pruneJobs(db());
+      if (pruned > 0) log.info("jobs.pruned", { count: pruned });
     }
   }
 
   async function claimOnce(): Promise<void> {
     if (wantReap) {
       wantReap = false;
-      const n = await failExhausted(db(), kinds);
-      if (n > 0) log.warn("jobs.lease_exhausted", { count: n });
-      if (o.now() - lastPrune > 3_600_000) {
-        lastPrune = o.now();
-        const pruned = await pruneJobs(db());
-        if (pruned > 0) log.info("jobs.pruned", { count: pruned });
-      }
+      await reap(() => o.hookTimeoutMs);
     }
     if (stopped) return;
     await claimAndLaunch(() => o.timeoutMs);
   }
 
-  function launch(j: ClaimedJob, timeoutMs: number): Promise<void> {
-    const p: Promise<void> = run(j, timeoutMs).finally(() => {
+  /**
+   * Apply a status change and run the kind's hook in one transaction. If the hook fails or times out the whole
+   * transaction is rolled back, so a late write from a hook that outlived its cap finds a finished transaction and
+   * cannot commit; the status change is then redone in a fresh transaction without the hook.
+   */
+  async function withHook<R>(
+    apply: (tx: JobTx) => Promise<R>,
+    hookFor: (result: R) => { job: JobInfo; code: string } | null,
+    redo: (result: R) => Promise<R>,
+    hookMs: () => number,
+  ): Promise<R> {
+    let applied: { result: R; job: JobInfo; err: unknown } | null = null;
+    try {
+      return await db().transaction(async (tx) => {
+        const result = await apply(tx);
+        const h = hookFor(result);
+        const hook = h && o.onGiveUp?.[h.job.kind];
+        if (h && hook) {
+          try {
+            await runHook(hook, tx, h.job, h.code, hookMs());
+          } catch (err) {
+            applied = { result, job: h.job, err };
+            throw new HookFailed();
+          }
+        }
+        return result;
+      });
+    } catch (err) {
+      const failed = applied as { result: R; job: JobInfo; err: unknown } | null;
+      if (!(err instanceof HookFailed) || !failed) throw err;
+      log.error("jobs.give_up_failed", { jobId: failed.job.id, kind: failed.job.kind, ...handlerErrorFields(failed.err) });
+      return redo(failed.result);
+    }
+  }
+
+  async function runHook(hook: JobGiveUp, tx: JobTx, j: JobInfo, code: string, limitMs: number): Promise<void> {
+    const controller = new AbortController();
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const work = Promise.resolve().then(() =>
+        hook({ id: j.id, kind: j.kind, key: j.key, ownerId: j.ownerId, payload: j.payload }, code, tx, controller.signal),
+      );
+      work.catch(() => {}); // a hook that outlives its timeout must not become an unhandled rejection
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort();
+          reject(new JobError("timeout"));
+        }, Math.max(1, limitMs));
+      });
+      await Promise.race([work, timeout]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  /** The cap for one hook: `hookTimeoutMs`, and in inline mode no more than what is left of the budget (at least 100 ms). */
+  function hookLimit(left?: () => number): number {
+    return inline && left ? Math.min(o.hookTimeoutMs, Math.max(left(), 100)) : o.hookTimeoutMs;
+  }
+
+  function launch(j: ClaimedJob, timeoutMs: number, left?: () => number): Promise<void> {
+    const p: Promise<void> = run(j, timeoutMs, left).finally(() => {
       running.delete(p);
       if (!inline) void pump(); // a slot is free: take the next due job (inline mode has no CPU to spare outside a kick)
     });
@@ -179,10 +293,13 @@ export function createWorker(options: WorkerOptions): Worker {
   async function kickWithinBudget(budgetMs: number, ids?: readonly string[]): Promise<void> {
     const started = o.now();
     const left = () => budgetMs - (o.now() - started);
+    // Inline mode has no timer to do this, so a kick does it, at most once per interval. It counts against the budget.
+    // Reaping stops at the budget; a hook may run a little past it (at least 100 ms) rather than be cut to nothing.
+    if (!stopped && o.now() - lastReap >= o.intervalMs) await reap(() => hookLimit(left), started + budgetMs);
     const mine: Promise<void>[] = [];
     while (!stopped && left() >= MIN_BUDGET_MS) {
       // Inline: a job may not outlive the request, so its timeout is what is left of the budget.
-      const launched = await claimAndLaunch(() => (inline ? Math.min(o.timeoutMs, Math.max(left(), MIN_BUDGET_MS)) : o.timeoutMs), ids);
+      const launched = await claimAndLaunch(() => (inline ? Math.min(o.timeoutMs, Math.max(left(), MIN_BUDGET_MS)) : o.timeoutMs), ids, left);
       if (launched === null) {
         await new Promise((r) => setTimeout(r, Math.min(left(), 25))); // all slots busy: wait for one
         continue;
@@ -221,7 +338,7 @@ export function createWorker(options: WorkerOptions): Worker {
     return ticking;
   }
 
-  async function run(j: ClaimedJob, timeoutMs: number): Promise<void> {
+  async function run(j: ClaimedJob, timeoutMs: number, left?: () => number): Promise<void> {
     const started = Date.now();
     const base = { jobId: j.id, kind: j.kind, attempt: j.attempts };
     const controller = new AbortController();
@@ -252,7 +369,13 @@ export function createWorker(options: WorkerOptions): Worker {
         if (await complete(db(), j)) log.info("jobs.done", { ...base, ms });
         else log.warn("jobs.lease_lost", base);
       } else {
-        const next = await fail(db(), j, failure);
+        const failed = failure;
+        const next = await withHook(
+          (tx) => fail(tx, j, failed),
+          (result) => (result === "failed" ? { job: j, code: failed.code } : null),
+          () => fail(db(), j, failed),
+          () => hookLimit(left),
+        );
         if (next === null) log.warn("jobs.lease_lost", base);
         else log.info(next === "failed" ? "jobs.failed" : "jobs.will_retry", { ...base, code: failure.code, ms });
       }

@@ -55,4 +55,26 @@ describe.skipIf(!url)("items data layer (Postgres)", () => {
     const { createItem } = await import("@/lib/items");
     await expect(createItem(alice, { title: "   " })).rejects.toThrow();
   });
+
+  it("rejects NUL bytes with a validation error instead of a database error", async () => {
+    const { createItem } = await import("@/lib/items");
+    await expect(createItem(alice, { title: "bad\0title" })).rejects.toMatchObject({ name: "ZodError" });
+    await expect(createItem(alice, { title: "ok", body: "bad\0body" })).rejects.toMatchObject({ name: "ZodError" });
+  });
+
+  it("is idempotent per owner and client op id: a replay returns the first item, never a second", async () => {
+    const { createItem, listItems } = await import("@/lib/items");
+    const clientOpId = crypto.randomUUID();
+    const first = await createItem(alice, { title: "once", clientOpId });
+    const again = await createItem(alice, { title: "once", clientOpId });
+    const parallel = await Promise.all([1, 2, 3].map(() => createItem(alice, { title: "once", clientOpId })));
+    expect(again.id).toBe(first.id);
+    expect(parallel.every((r) => r.id === first.id)).toBe(true);
+    expect((await listItems(alice)).filter((i) => i.title === "once")).toHaveLength(1);
+    // Another user with the same op id gets their own item and never sees alice's.
+    const bobs = await createItem(bob, { title: "once", clientOpId });
+    expect(bobs.id).not.toBe(first.id);
+    expect(bobs.ownerId).toBe(bob.id);
+    await expect(createItem(alice, { title: "x", clientOpId: "not-a-uuid" })).rejects.toThrow();
+  });
 });

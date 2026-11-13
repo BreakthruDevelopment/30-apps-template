@@ -34,11 +34,23 @@ The BreakthruDevelopment org holds other, unrelated applications.
 ## How code must be written
 
 - **Authorize on the server, every time.** Pages call `requireUserOrRedirect()` / `requireRoleOrRedirect()`; route handlers and server actions call `requireUser()` / `requireRole()`. Data functions take the acting user and call `assertCan()`.
-- **Validate all input with zod** at the boundary (route handler, server action, data function).
+- **Validate all input with zod** at the boundary (route handler, server action, data function). Free text goes through `text()` in `src/lib/text.ts`, which trims, caps the length and rejects NUL bytes (`\0`): Postgres can't store them, so they would otherwise be a 500.
 - **AI features:** define a zod output schema, add a demo fixture in `src/lib/ai/demo.ts` for the task, treat user content in prompts as data (say so in the system prompt), and cap input size.
 - **Errors:** route handlers return `errorResponse(err)`; never send stack traces to clients.
 - **Logs:** use `log` from `src/lib/log.ts` (JSON lines). Never log secrets, tokens, passwords or full prompts with personal data.
 - **Responsive:** every page must work at 375px wide.
+
+## Builder checklist (what reviews of apps 5-12 kept finding)
+
+- [ ] **Retries are idempotent.** A mutation a user can double-tap or retry carries a client op id (`opFor` in `src/lib/client-op.ts`, kept in a ref until the server answers ok or conflict) and the server enforces it with a unique index, as `createItem` does.
+- [ ] **Async buttons reset in `finally`** and show an error: use `useAsyncAction` / `runAsyncAction`. A thrown action must never leave a button disabled or silent.
+- [ ] **375px check with a long unbroken string** (60+ characters, no spaces) in every user-text field; `break-words` and `min-w-0` where it overflows.
+- [ ] **NUL bytes are rejected** at the boundary (`text()`; `jsonHasNul` for JSON payloads), with a 400 and a test.
+- [ ] **Public routes have a per-IP limit** (`allowPublicRequest(clientIp(request))` in `src/lib/ip-limit.ts`); signed-in routes use the per-user limits in `usage.ts`. Read the `X-Forwarded-For` note in `ip-limit.ts` for your cloud.
+- [ ] **Structured AI output is checked on the server**: the zod schema parses the model's answer, and any ids or references in it are verified against the database before use.
+- [ ] **Smoke runs back-to-back after seeding.** Sign-ups in `scripts/smoke.sh` go through `post_auth`, which waits out Better Auth's 429 and retries once.
+- [ ] **`onGiveUp` hooks:** use only the `tx` argument, never `db()`; no slow calls (network, AI); never touch the `job` table. Writes made outside `tx` are not rolled back when the hook fails.
+- [ ] **Jobs:** register handlers (and `onGiveUp` for anything the user must see fail) in `src/lib/jobs/handlers.ts`; on Cloud Run (`K_SERVICE`) and Lambda jobs run inline inside `kick()`. Fetch user URLs only with `safeFetch`.
 
 ## Definition of done (CI enforces most of it)
 
