@@ -44,7 +44,18 @@ The BreakthruDevelopment org holds other, unrelated applications.
 
 - [ ] **Retries are idempotent.** A mutation a user can double-tap or retry carries a client op id (`opFor` in `src/lib/client-op.ts`, kept in a ref until the server answers ok or conflict) and the server enforces it with a unique index, as `createItem` does.
 - [ ] **Async buttons reset in `finally`** and show an error: use `useAsyncAction` / `runAsyncAction`. A thrown action must never leave a button disabled or silent.
-- [ ] **375px check with a long unbroken string** (60+ characters, no spaces) in every user-text field; `break-words` and `min-w-0` where it overflows.
+- [ ] **375px check with a long unbroken string** (60+ characters, no spaces) in every user-text field. Fix an
+      overflow with **`wrap-anywhere`**. Not `break-words`: it emits `overflow-wrap: break-word`, which wraps the
+      text but leaves the element's min-content width at the longest word, so a grid or flex track still grows and
+      the page scrolls sideways (measured: min-content 497px with `break-word`, 7px with `anywhere`). `break-words`
+      can be made to work with `min-width: 0` on *every* ancestor track, but it breaks silently the moment someone
+      adds a wrapper — a 2-deep flex missing `min-w-0` in the middle measures 529px at a 375px viewport.
+      Prefer `wrap-anywhere` over the arbitrary `[overflow-wrap:anywhere]`: Tailwind emits it *after* `.break-words`,
+      so a stray `break-words` alongside it loses on source order instead of silently cancelling the fix — which is
+      exactly what happened in `15-event-ticketing#17`, where `/tickets` measured 857 against a 375 viewport with
+      both classes present and the correct one inert.
+      Verify by measuring `document.documentElement.scrollWidth === clientWidth` at 375 and 1280 — compare against
+      `clientWidth`, not the viewport number, or a classic scrollbar reads 1265 at 1280 and looks like a failure.
 - [ ] **NUL bytes are rejected** at the boundary (`text()`; `jsonHasNul` for JSON payloads), with a 400 and a test.
 - [ ] **Public routes have a per-IP limit** (`allowPublicRequest(clientIp(request))` in `src/lib/ip-limit.ts`); signed-in routes use the per-user limits in `usage.ts`. Read the `X-Forwarded-For` note in `ip-limit.ts` for your cloud.
 - [ ] **Structured AI output is checked on the server**: the zod schema parses the model's answer, and any ids or references in it are verified against the database before use.
