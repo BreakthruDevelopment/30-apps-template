@@ -44,7 +44,12 @@ The BreakthruDevelopment org holds other, unrelated applications.
 
 - [ ] **Retries are idempotent.** A mutation a user can double-tap or retry carries a client op id (`opFor` in `src/lib/client-op.ts`, kept in a ref until the server answers ok or conflict) and the server enforces it with a unique index, as `createItem` does.
 - [ ] **Async buttons reset in `finally`** and show an error: use `useAsyncAction` / `runAsyncAction`. A thrown action must never leave a button disabled or silent.
-- [ ] **375px check with a long unbroken string** (60+ characters, no spaces) in every user-text field; `break-words` and `min-w-0` where it overflows.
+- [ ] **375px check with a long unbroken string** (60+ characters, no spaces) in every user-text field. Fix an
+      overflow with **`[overflow-wrap:anywhere]`**, plus `min-w-0` on the flex or grid child. **Not `break-words`:**
+      it emits `overflow-wrap: break-word`, which wraps the text but does *not* reduce the element's min-content
+      width, so a grid or flex track still grows to fit the whole word. Writing both is worse than writing neither
+      useful one — Tailwind emits them at equal specificity, so `.break-words` wins on source order and silently
+      cancels the fix. Measure `document.documentElement.scrollWidth` at 375 and 1280; it must equal the viewport.
 - [ ] **NUL bytes are rejected** at the boundary (`text()`; `jsonHasNul` for JSON payloads), with a 400 and a test.
 - [ ] **Public routes have a per-IP limit** (`allowPublicRequest(clientIp(request))` in `src/lib/ip-limit.ts`); signed-in routes use the per-user limits in `usage.ts`. Read the `X-Forwarded-For` note in `ip-limit.ts` for your cloud.
 - [ ] **Structured AI output is checked on the server**: the zod schema parses the model's answer, and any ids or references in it are verified against the database before use.
