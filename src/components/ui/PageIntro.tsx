@@ -18,7 +18,7 @@ export function PageIntro({
       <h1 className="font-display text-4xl font-semibold leading-tight tracking-tight wrap-anywhere sm:text-5xl">
         {title}
       </h1>
-      {description && <p className="max-w-2xl text-lg text-muted">{description}</p>}
+      {description && <p className="max-w-2xl wrap-anywhere text-lg text-muted">{description}</p>}
       {actions && <div className="flex flex-wrap gap-3 pt-2">{actions}</div>}
     </section>
   );
