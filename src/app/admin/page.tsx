@@ -24,6 +24,7 @@ export default async function AdminPage() {
   type Row = (typeof users)[number];
   const columns: Column<Row>[] = [
     { key: "name", header: "Name", primary: true, cell: (u) => u.name },
+    // Deliberate: email keeps break-all (an address has no word boundaries, so it fills each line). Everything else uses wrap-anywhere.
     { key: "email", header: "Email", className: "break-all", cell: (u) => <span className="break-all">{u.email}</span> },
     {
       key: "role",

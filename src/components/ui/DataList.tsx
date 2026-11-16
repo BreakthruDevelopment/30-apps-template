@@ -80,14 +80,14 @@ export function DataList<T>({
       >
         {rows.map((row) => (
           <li key={rowKey(row)} className="space-y-2 rounded-card border border-border bg-surface p-4">
-            <h3 className="font-semibold break-words">{primary.cell(row)}</h3>
+            <h3 className="font-semibold wrap-anywhere">{primary.cell(row)}</h3>
             <dl className="space-y-1 text-sm">
               {rest
                 .filter((c) => !c.hideLabel)
                 .map((c) => (
                   <div key={c.key} className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted">{c.header}</dt>
-                    <dd className="min-w-0 text-right break-words">{c.cell(row)}</dd>
+                    <dd className="min-w-0 text-right wrap-anywhere">{c.cell(row)}</dd>
                   </div>
                 ))}
             </dl>

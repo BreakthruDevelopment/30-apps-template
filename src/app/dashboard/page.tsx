@@ -38,8 +38,8 @@ export default async function DashboardPage({ searchParams }: PageProps<"/dashbo
     );
 
   const columns: Column<Item>[] = [
-    { key: "title", header: "Item", primary: true, cell: (i) => <span className="font-semibold break-words">{i.title}</span> },
-    { key: "body", header: "Details", cell: (i) => <span className="text-muted break-words">{i.body || "—"}</span> },
+    { key: "title", header: "Item", primary: true, cell: (i) => <span className="font-semibold wrap-anywhere">{i.title}</span> },
+    { key: "body", header: "Details", cell: (i) => <span className="text-muted wrap-anywhere">{i.body || "—"}</span> },
     {
       key: "created",
       header: "Added",
