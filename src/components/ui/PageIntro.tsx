@@ -15,7 +15,7 @@ export function PageIntro({
   return (
     <section className="mb-8 space-y-3">
       <p className="text-sm font-semibold uppercase tracking-wide text-accent">Breakthru Ventures / {section}</p>
-      <h1 className="font-display text-4xl font-semibold leading-tight tracking-tight break-words sm:text-5xl">
+      <h1 className="font-display text-4xl font-semibold leading-tight tracking-tight wrap-anywhere sm:text-5xl">
         {title}
       </h1>
       {description && <p className="max-w-2xl text-lg text-muted">{description}</p>}
