@@ -18,7 +18,7 @@
   "dependencies": {
     "better-auth": "^1.7.15",
     "drizzle-orm": "^0.45.4",
-    "next": "16.4.4",
+    "next": "16.4.6",
     "postgres": "^4.0.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
@@ -33,7 +33,7 @@
     "@vitest/coverage-v8": "^5.1.0",
     "drizzle-kit": "^0.31.11",
     "eslint": "^9",
-    "eslint-config-next": "16.4.4",
+    "eslint-config-next": "16.4.6",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "typescript": "^5",
