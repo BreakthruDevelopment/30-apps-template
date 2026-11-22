@@ -4,6 +4,12 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   pull_request_review:
     types: [submitted, edited, dismissed]
+  issue_comment:
+    # A reusable workflow runs on its CALLER's triggers, so this has to be here and not only in
+    # ai-dev-os. Codex records a clean pass by EDITING its own state comment, which fires neither
+    # pull_request nor pull_request_review: without this, the gate keeps a failure that is already
+    # false, with no event left to clear it. Apps 18-30 are generated from this file.
+    types: [created, edited]
 permissions:
   contents: read
   pull-requests: read
